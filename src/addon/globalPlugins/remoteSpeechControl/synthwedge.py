@@ -10,29 +10,30 @@ we drop calls here, the controller still hears NVDA — only the local audio
 on the controlled machine goes silent. Wrapping speech.speak instead would
 also block the upstream forward, which is exactly wrong.
 
-Pretending to take real time to "speak"
----------------------------------------
-NVDA's say-all (used for "read all", and for any continuous reading of
-rich-text or HTML content) chunks the text and queues the next chunk only
-when the synth signals it has reached the IndexCommand at the end of the
-current chunk. If we drop a speak() and fire synthIndexReached straight
-away, NVDA bursts through the whole document in microseconds — and when
-the user hits Shift to pause, the cursor is at the end with nothing left
-to cancel.
+Silent completion
+-----------------
+NVDA's say-all (used for "read all", rich text and HTML reading) queues
+the next chunk only after the synth signals it has reached the IndexCommand
+at the end of the current chunk. If we drop a speak() and never fire that
+signal, say-all stalls. So when we drop, we fire synthIndexReached for
+each IndexCommand in the dropped sequence followed by synthDoneSpeaking,
+deferred to the next wx event-loop tick so the dispatch is asynchronous
+(same as a real synth firing them from its audio callback thread).
 
-So we estimate how long a real synth would take to read the sequence
-(characters times approximate rate of the active synth) and schedule the
-index and done-speaking events for that future time via wx.CallLater. To
-make pause/stop behave correctly, we also wrap synth.cancel() and abort
-every pending timer when it fires.
+We deliberately do NOT try to estimate real-time speech duration and pace
+the index events accordingly. Earlier versions did, with a chars-per-second
+heuristic; the heuristic was inevitably wrong for some synth + rate
+combinations and produced audible pauses between forwarded lines on the
+controller side. The controller's own local synth already provides natural
+playback pacing for forwarded speech, so we just fire the events promptly
+and let NVDA's say-all proceed at whatever pace the wx event loop allows.
 
-We re-wrap on every synthChanged event because changing synth (driver or
-voice) replaces the live SynthDriver instance.
+We re-wrap on synthChanged because changing synth or voice replaces the
+live SynthDriver instance.
 """
 from __future__ import annotations
 
-import threading
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional
 
 from . import logger
 from . import state as state_module
@@ -41,58 +42,11 @@ log = logger.get()
 
 
 _original_speak: Optional[Callable[..., Any]] = None
-_original_cancel: Optional[Callable[..., Any]] = None
 _wrapped_synth: Optional[Any] = None
 _synth_changed_handler: Optional[Callable[..., None]] = None
 
-_pending_timers: List[Any] = []
-_pending_lock = threading.Lock()
 
-_DEFAULT_CHARS_PER_SEC = 15.0
-
-
-def _compute_chars_per_second(synth: Any) -> float:
-    """Map the synth's rate to an approximate speech speed.
-
-    NVDA synths expose ``rate`` on 0-100 (50 ≈ default ≈ ~150 wpm ≈ 12-15
-    chars/sec). Linear interpolate 5 cps at rate 0 to 50 cps at rate 100,
-    which is in the ballpark for most voices.
-    """
-    try:
-        rate = getattr(synth, "rate", None)
-        if rate is None:
-            return _DEFAULT_CHARS_PER_SEC
-        rate = float(rate)
-    except (TypeError, ValueError):
-        return _DEFAULT_CHARS_PER_SEC
-    return max(1.0, 5.0 + (rate / 100.0) * 45.0)
-
-
-def _cancel_all_pending() -> None:
-    with _pending_lock:
-        timers = list(_pending_timers)
-        _pending_timers.clear()
-    for t in timers:
-        try:
-            t.Stop()
-        except Exception:
-            pass
-
-
-def _track_timer(timer: Any) -> None:
-    with _pending_lock:
-        _pending_timers.append(timer)
-
-
-def _untrack_timer(timer: Any) -> None:
-    with _pending_lock:
-        try:
-            _pending_timers.remove(timer)
-        except ValueError:
-            pass
-
-
-def _schedule_silent_completion(speechSequence: Any, synth: Any) -> None:
+def _emit_silent_completion(speechSequence: Any) -> None:
     try:
         import wx
         import synthDriverHandler
@@ -104,51 +58,35 @@ def _schedule_silent_completion(speechSequence: Any, synth: Any) -> None:
         log.exception("rsc: silent completion imports failed")
         return
 
-    cps = _compute_chars_per_second(synth)
-    chars_so_far = 0
-    scheduled: List = []  # (delay_seconds, callable)
+    synth = synthDriverHandler.getSynth()
+    if synth is None:
+        return
 
-    for item in speechSequence:
-        if isinstance(item, str):
-            chars_so_far += len(item)
-        elif IndexCommand is not None and isinstance(item, IndexCommand):
-            delay_s = chars_so_far / cps
-            idx = item.index
+    indices = []
+    if IndexCommand is not None:
+        for item in speechSequence:
+            if isinstance(item, IndexCommand):
+                indices.append(item.index)
 
-            def fire_index(_idx=idx, _syn=synth, _self=None):
-                _untrack_timer(_self["t"]) if _self else None
-                try:
-                    synthDriverHandler.synthIndexReached.notify(synth=_syn, index=_idx)
-                except Exception:
-                    pass
-
-            scheduled.append((delay_s, fire_index))
-
-    total_delay_s = chars_so_far / cps
-
-    def fire_done():
+    def fire():
+        for index in indices:
+            try:
+                synthDriverHandler.synthIndexReached.notify(synth=synth, index=index)
+            except Exception:
+                pass
         try:
             synthDriverHandler.synthDoneSpeaking.notify(synth=synth)
         except Exception:
             pass
 
-    scheduled.append((total_delay_s, fire_done))
-
-    for delay_s, fn in scheduled:
-        ms = max(1, int(delay_s * 1000))
-        timer_holder: dict = {}
-
-        def wrapper(_fn=fn, _holder=timer_holder):
-            _untrack_timer(_holder.get("t"))
-            _fn()
-
-        timer = wx.CallLater(ms, wrapper)
-        timer_holder["t"] = timer
-        _track_timer(timer)
+    try:
+        wx.CallAfter(fire)
+    except Exception:
+        log.exception("rsc: scheduling silent completion failed")
 
 
 def _wrap(synth: Any) -> None:
-    global _original_speak, _original_cancel, _wrapped_synth
+    global _original_speak, _wrapped_synth
     if synth is None or synth is _wrapped_synth:
         return
     _unwrap_current()
@@ -157,38 +95,26 @@ def _wrap(synth: Any) -> None:
     except AttributeError:
         log.warning("rsc: synth has no speak attr: %r", synth)
         return
-    original_cancel = getattr(synth, "cancel", None)
 
     def speak(speechSequence, *args, **kwargs):
         if state_module.state.should_drop_speech:
-            _schedule_silent_completion(speechSequence, synth)
+            _emit_silent_completion(speechSequence)
             return None
         return original_speak(speechSequence, *args, **kwargs)
 
-    def cancel(*args, **kwargs):
-        try:
-            _cancel_all_pending()
-        except Exception:
-            log.exception("rsc: _cancel_all_pending failed; cancel continuing")
-        if original_cancel is not None:
-            return original_cancel(*args, **kwargs)
-
     try:
         synth.speak = speak
-        if original_cancel is not None:
-            synth.cancel = cancel
     except (AttributeError, TypeError):
-        log.warning("rsc: cannot bind overrides on %r", synth)
+        log.warning("rsc: cannot bind speak override on %r", synth)
         return
 
     _original_speak = original_speak
-    _original_cancel = original_cancel
     _wrapped_synth = synth
-    log.info("rsc: wrapped synth speak/cancel on %s", type(synth).__name__)
+    log.info("rsc: wrapped synth speak on %s", type(synth).__name__)
 
 
 def _unwrap_current() -> None:
-    global _original_speak, _original_cancel, _wrapped_synth
+    global _original_speak, _wrapped_synth
     if _wrapped_synth is None:
         return
     if _original_speak is not None:
@@ -196,15 +122,8 @@ def _unwrap_current() -> None:
             _wrapped_synth.speak = _original_speak
         except Exception:
             pass
-    if _original_cancel is not None:
-        try:
-            _wrapped_synth.cancel = _original_cancel
-        except Exception:
-            pass
     _wrapped_synth = None
     _original_speak = None
-    _original_cancel = None
-    _cancel_all_pending()
 
 
 def install() -> None:
