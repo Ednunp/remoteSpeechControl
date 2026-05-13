@@ -42,6 +42,16 @@ class RemoteSpeechControlPanel(SettingsPanel):
         )
         self._keep_ring_ctrl.SetValue(config_spec.get_keep_synth_settings_ring_local())
 
+        self._auto_update_ctrl = helper.addItem(
+            wx.CheckBox(self, label="Check for &updates daily")
+        )
+        self._auto_update_ctrl.SetValue(config_spec.get_auto_update_check())
+
+        self._check_now_btn = helper.addItem(
+            wx.Button(self, label="&Check for updates now")
+        )
+        self._check_now_btn.Bind(wx.EVT_BUTTON, self._on_check_now_clicked)
+
         self._verbose_ctrl = helper.addItem(
             wx.CheckBox(self, label="&Verbose logging")
         )
@@ -58,21 +68,30 @@ class RemoteSpeechControlPanel(SettingsPanel):
             )
         )
 
+    def _on_check_now_clicked(self, event: wx.CommandEvent) -> None:
+        try:
+            from . import selfupdater
+            selfupdater.check_now(interactive=True)
+        except Exception:
+            log.exception("rsc: triggering manual update check failed")
+
     def onSave(self) -> None:
         section = config.conf[config_spec.SECTION]
         section["password"] = self._password_ctrl.GetValue()
         section["autoRequestOnConnect"] = self._auto_ctrl.GetValue()
         section["allowAutoMute"] = self._allow_ctrl.GetValue()
         section["keepSynthSettingsRingLocal"] = self._keep_ring_ctrl.GetValue()
+        section["autoUpdateCheck"] = self._auto_update_ctrl.GetValue()
         section["verboseLogging"] = self._verbose_ctrl.GetValue()
         logger.configure_verbosity(section["verboseLogging"])
         log.info(
             "rsc: settings saved (password set: %s, auto-request: %s, allow-auto-mute: %s, "
-            "keep-ring-local: %s, verbose: %s)",
+            "keep-ring-local: %s, auto-update: %s, verbose: %s)",
             bool(section["password"]),
             section["autoRequestOnConnect"],
             section["allowAutoMute"],
             section["keepSynthSettingsRingLocal"],
+            section["autoUpdateCheck"],
             section["verboseLogging"],
         )
         try:
@@ -80,3 +99,8 @@ class RemoteSpeechControlPanel(SettingsPanel):
             remoteintegration.apply_keep_synth_ring_local()
         except Exception:
             log.exception("rsc: failed applying keep-synth-ring-local after save")
+        try:
+            from . import selfupdater
+            selfupdater.refresh_schedule()
+        except Exception:
+            log.exception("rsc: failed refreshing update schedule after save")

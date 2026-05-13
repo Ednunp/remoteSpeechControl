@@ -16,6 +16,7 @@ from . import state as state_module
 from . import synthwedge
 from . import inputmonitor
 from . import remoteintegration
+from . import selfupdater
 from . import settings as settings_module
 
 log = logger.get()
@@ -35,6 +36,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         synthwedge.install()
         inputmonitor.install()
         remoteintegration.install()
+        selfupdater.start()
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(
             settings_module.RemoteSpeechControlPanel
         )
@@ -48,6 +50,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             )
         except ValueError:
             pass
+        try:
+            selfupdater.stop()
+        except Exception:
+            log.exception("rsc: selfupdater.stop failed")
         remoteintegration.uninstall()
         inputmonitor.uninstall()
         synthwedge.uninstall()
