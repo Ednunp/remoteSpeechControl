@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+dist/
+*.tmp
+*.tmp.*
+.gh-token.txt
+*.log
+.DS_Store
+Thumbs.db
+*.swp

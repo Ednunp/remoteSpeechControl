@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Remote Speech Control</title>
+</head>
+<body>
+<h1>Remote Speech Control</h1>
+
+<p>Two related features for NVDA Remote sessions:</p>
+
+<ol>
+<li><strong>Speech muting on the controlled machine.</strong> Silences NVDA's local speech on a machine that is being controlled by NVDA Remote, while a remote keyboard is driving NVDA. The moment a real keypress is detected on the controlled machine, speech resumes; it mutes again on the next remote keystroke. Muting is gated by a shared password, by explicit per-session consent from the controlled side's user, and (while the consent prompt is pending) by a freeze on all remote input.</li>
+<li><strong>Local synth settings ring.</strong> Optionally keeps NVDA's synth settings ring (rate, pitch, volume etc.) on the controller's local NVDA while you are in remote control mode, instead of forwarding those keystrokes to the remote.</li>
+</ol>
+
+<h2>Why this exists</h2>
+
+<p>The problem this add-on solves is doubled audio when you control one machine from another with NVDA Remote and you also have some way of streaming the controlled machine's sound back to where you are sitting. That second channel can be a low-latency audio-over-IP tool, Windows' own Sound Forwarding, a virtual audio cable — anything that mirrors the controlled machine's playback to your local speakers.</p>
+
+<p>In that arrangement NVDA Remote already forwards speech to your controlling NVDA, so your local synth speaks every announcement. At the same time, the controlled machine's NVDA is also speaking through its own audio device, and the audio-streaming setup is faithfully relaying that to you a fraction of a second later. The two voices overlap, slightly out of sync, and the controlled machine becomes unusable to drive remotely.</p>
+
+<p>You could just change the controlled machine's NVDA output to a silent or virtual audio device, but it is far too easy to forget to switch it back. Arriving at the controlled machine later and finding no speech at all is worse than the doubled audio you were trying to fix in the first place.</p>
+
+<p>This add-on silences the controlled machine's local NVDA <em>only</em> while you are remotely driving it. The moment you press a key on the controlled machine itself, speech resumes immediately. There is nothing to remember to switch back, because there is no manual switch — only your own keystroke on the local keyboard turns speech off and on again.</p>
+
+<p>The companion feature, keeping NVDA's synth settings ring on your controlling machine, addresses a related annoyance. When NVDA Remote is forwarding speech, the synth you actually hear is your local one. Adjusting rate, pitch, volume or voice ought to change <em>your</em> local NVDA, not the remote NVDA you can no longer hear. Without this add-on, those gestures are forwarded to the remote and adjust nothing audible.</p>
+
+<h2>Setting up</h2>
+
+<p>Install the add-on on both machines. Open the NVDA menu, choose Preferences, then Settings, then the Remote Speech Control category. Type the same password into the Password field on both ends. The password is never transmitted over the network; only a signed proof of it is, so an attacker who captures network traffic cannot recover it.</p>
+
+<p>If you regularly control the same two machines from each other, you can pre-consent on each side using the two checkboxes described below. By default both are unticked, which means every mute requires an explicit yes from each side.</p>
+
+<h2>Settings</h2>
+
+<h3>Password</h3>
+<p>Shared secret between the two machines. It must match exactly on both ends, including case. Without a password on either side, the mute feature does nothing.</p>
+
+<h3>Auto-request mute when I connect as controller (Alt+A)</h3>
+<p>Controller-side setting. When ticked, your machine automatically sends a mute request to the controlled machine the moment a remote session connects, instead of popping a yes/no prompt on your side first. Default unticked.</p>
+
+<h3>Allow speech to be automatically muted by controlling machine (Alt+M)</h3>
+<p>Controlled-side setting. When ticked, your machine accepts authenticated mute requests without prompting you, and without freezing remote input. When unticked, you get a yes/no dialog asking whether to allow muting, all remote input is paused until you answer, and nothing is muted until you accept. Default unticked.</p>
+
+<h3>Synth settings ring adjusts this machine, not the remote (Alt+S)</h3>
+<p>Controller-side setting. When ticked, pressing NVDA's synth settings ring gestures (move between settings, increase, decrease) while in remote control mode adjusts the local NVDA's voice, rate, pitch, volume and so on, rather than being forwarded to the remote. Default unticked.</p>
+
+<h3>Verbose logging (Alt+V)</h3>
+<p>Writes detailed activity into NVDA's main log. Useful for diagnosing problems. Default ticked.</p>
+
+<h2>Using the mute feature</h2>
+
+<p>Connect with NVDA Remote as usual. Within a second or two of the session coming up:</p>
+
+<ul>
+<li>On the controlling machine, you will be asked "Mute speech on the remote machine while you control it from here?", unless you ticked Auto-request mute, in which case the request goes straight away.</li>
+<li>On the controlled machine, you will be asked "The controller has requested to mute speech on this machine. Remote input is paused until you answer. Allow muting for this session?", unless you ticked Allow speech to be automatically muted, in which case the request is accepted straight away without freezing input.</li>
+</ul>
+
+<p>Once both sides accept, NVDA's local speech on the controlled machine is dropped for as long as input is coming from the controller's keyboard. The moment any key is pressed on the controlled machine itself, speech resumes immediately — until the next remote keystroke, which mutes it again. This is what is meant by "ping-pong".</p>
+
+<p>Disconnecting the NVDA Remote session always unmutes the controlled machine automatically.</p>
+
+<h2>The remote-input freeze during consent</h2>
+
+<p>While the controlled machine is waiting for the local user to answer the consent prompt, all remote keyboard and braille input from the controller is paused on the controlled machine. This is the security property that distinguishes consent from a yes/no the controller can simply press themselves. Only the local user's physical keyboard (or other locally-attached input) can resolve the prompt.</p>
+
+<p>The controller's NVDA will announce "Waiting for remote user to allow mute. Remote input is paused." when the freeze begins. After the local user answers, input flows again — and you will hear the result announced ("Remote machine speech muted" or "Remote machine declined the mute request").</p>
+
+<p>If you want to skip the freeze entirely, tick "Allow speech to be automatically muted by controlling machine" on the controlled machine. With that ticked, authenticated mute requests apply immediately and no consent prompt or input freeze ever happens.</p>
+
+<h2>Force-unmute</h2>
+
+<p>If you arrive at the controlled machine and want to fully release the mute, so that the controller would have to make a new request before muting again, press <kbd>NVDA+shift+u</kbd>. This unmutes immediately and forgets the consent you gave for this session.</p>
+
+<p>The shortcut is rebindable. Open the NVDA menu, choose Preferences, then Input gestures, then look under the Remote Speech Control category.</p>
+
+<h2>Synth settings ring on the local machine</h2>
+
+<p>NVDA's synth settings ring (default gestures around NVDA+control or NVDA+control+shift with the arrow keys, depending on your configuration) lets you cycle through synthesiser settings and adjust them. Without this add-on, those keystrokes are forwarded to the remote machine while you are in remote control mode — useless because you are listening to your local speech, not the remote's.</p>
+
+<p>Tick "Synth settings ring adjusts this machine, not the remote" on the controller side and those specific gestures stay local. All other keystrokes still forward to the remote normally. NVDA Remote already had a mechanism for keeping specific scripts local; we just register the four ring scripts (plus the two large-step variants) with it.</p>
+
+<h2>Security</h2>
+
+<p>The add-on proves the two ends are paired using a shared password. The password is fed through PBKDF2-HMAC-SHA256 to derive a key, which is used to sign each mute request with an HMAC. The signature includes a random nonce and a timestamp, both of which are checked on receipt to prevent replay attacks. After three failed authentication attempts on the same transport, further requests are silently dropped for sixty seconds.</p>
+
+<p>If a controller can connect to your NVDA Remote channel but does not have the password set, they cannot mute your speech. If they have the password but you have not ticked Allow speech to be automatically muted, you will still be prompted before any mute takes effect — and crucially, the controller cannot answer that prompt themselves, because remote input is frozen on your machine until you do.</p>
+
+<h2>Troubleshooting</h2>
+
+<p>The add-on writes its progress and errors into NVDA's main log. Open the NVDA menu, choose Tools, then View log. Search for lines beginning <code>rsc:</code>.</p>
+
+<p>On a working session you should see, on each machine, lines like "starting up", "wrapped synth speak", "WH_KEYBOARD_LL hook installed", and "_remoteClient integration installed". When a session connects you should see "transport connected" and "announcing capability". When the two sides have exchanged capability messages you should see "peer capability received".</p>
+
+<p>If muting never happens, the most common cause is the password being different on the two machines. Set it again on both ends and try.</p>
+
+</body>
+</html>
