@@ -29,7 +29,7 @@ NVDA menu → Preferences → Settings → Remote Speech Control.
 - **Synth settings ring adjusts this machine, not the remote** — when ticked, NVDA's synth settings ring keys are routed to your local NVDA while you are in remote control mode, instead of being forwarded to the remote. Default off.
 - **Verbose logging** — writes detailed activity into NVDA's log under `rsc:` lines. Useful for diagnosing problems. Default on.
 
-The force-unmute hotkey is `NVDA+shift+u` by default; rebindable from NVDA's Input gestures dialog under the Remote Speech Control category.
+The toggle-mute hotkey is `NVDA+shift+m` by default, on the controlling side only and active while you are F11'd into the remote machine. It opens a yes/no confirmation and on yes sends a mute or unmute request to the controlled side. The controlled user has no equivalent hotkey — pressing any key on the controlled keyboard restores audible speech via ping-pong. Rebindable from NVDA's Input gestures dialog under the Remote Speech Control category.
 
 ## How muting works in practice
 

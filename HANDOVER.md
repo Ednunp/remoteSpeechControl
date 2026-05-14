@@ -36,8 +36,8 @@ D:\proj\remoteSpeechControl\
       config_spec.py                          # config schema + accessors
       state.py                                # mute state machine
       protocol.py                             # HMAC handshake + replay protection
-      synthwedge.py                           # synth.speak / cancel patches
-      inputmonitor.py                         # WH_KEYBOARD_LL hook
+      audiomute.py                            # OS-level WASAPI session mute (ISimpleAudioVolume.SetMute)
+      inputmonitor.py                         # WH_KEYBOARD_LL hook for ping-pong attribution
       remoteintegration.py                    # patches into NVDA's _remoteClient
       selfupdater.py                          # daily GitHub release poll
       settings.py                             # Settings panel
@@ -58,18 +58,22 @@ Defines `GlobalPlugin`, which NVDA instantiates once at startup. Its `__init__` 
 
 ```
 config_spec.install()         # register our section in NVDA's config schema
-synthwedge.install()          # patch synth.speak / cancel
-inputmonitor.install()        # install the low-level keyboard hook
+audiomute.install()           # arm OS-level WASAPI mute via state listener
+inputmonitor.install()        # install WH_KEYBOARD_LL hook for ping-pong
 remoteintegration.install()   # patch _remoteClient
 selfupdater.start()           # schedule daily update check (if enabled)
 gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(RemoteSpeechControlPanel)
 ```
 
-`terminate()` does the reverse in safe order. The force-unmute hotkey (`NVDA+shift+u`, rebindable) lives here as a script method; it calls `state.set_muted_by_remote(False)` and, if we're the controller, sends an `unmute_request` to the peer.
+`terminate()` does the reverse in safe order. The toggle-mute hotkey (`NVDA+shift+m`, rebindable) lives here as a script method; it delegates to `remoteintegration.toggle_mute_action()`, which is controller-only and gated on `RemoteClient.sendingKeys` (i.e. the controller has F11'd into the controlled machine). When active, it sends an authenticated `mute_request` or `unmute_request` directly — no confirmation dialog on the controller side, because pressing the hotkey is itself the confirmation and the user's keystrokes are forwarded to the remote while they are F11'd in, which would make a local dialog impossible to navigate anyway. Mute direction is chosen from `_peer_muted_state`, the controller-side mirror of the controlled peer's mute state from inbound `MSG_STATE` acknowledgements. The controlled side has no hotkey by design — local user unmute is handled by ping-pong on any keystroke via the LL hook. To mute themselves persistently the controlled user asks the controller to toggle.
+
+On `__init__`, the GlobalPlugin also calls `remoteintegration.register_persistent_local_script(self.script_toggleMute)`. That adds the script to NVDA Remote's `localScripts`, so when the controller is F11'd in, NVDA Remote runs the script locally instead of forwarding the keystroke as input to the controlled side.
 
 ### `logger.py` — log routing
 
-Five-line wrapper that forwards `info/debug/warning/error/exception` to NVDA's `logHandler.log`. The reason it exists at all: an earlier version of this add-on used `logging.getLogger(name)` directly and nothing reached NVDA's main log because of how NVDA configures its handlers. `logHandler.log` is the canonical entry point and is guaranteed to land in NVDA's `nvda.log`. All messages begin with the prefix `rsc:` so they're easy to grep.
+Small wrapper that forwards `info/debug/warning/error/exception` to NVDA's `logHandler.log`. The reason it exists at all: an earlier version of this add-on used `logging.getLogger(name)` directly and nothing reached NVDA's main log because of how NVDA configures its handlers. `logHandler.log` is the canonical entry point and is guaranteed to land in NVDA's `nvda.log`. All messages begin with the prefix `rsc:` so they're easy to grep.
+
+The user-facing "Verbose logging" checkbox is wired through `configure_verbosity(bool)`: when off, `info`-level emission is suppressed; `warning`, `error` and `exception` still fire so genuine problems are never hidden. Default on, because the log is the main diagnostic surface.
 
 ### `config_spec.py` — settings persistence
 
@@ -92,14 +96,14 @@ All "Auto-X" toggles default to False per the workspace rule of explicit opt-in.
 
 Two booleans:
 
-- `muted_by_remote` — set True when an authenticated `mute_request` has been honoured. Cleared on disconnect, on force-unmute, or on an authenticated `unmute_request`.
-- `remote_driving` — set True on every remote-driven keystroke, cleared on every physical local keystroke. Strict ping-pong, no timeout.
+- `muted_by_remote` — set True when an authenticated `mute_request` has been honoured. Cleared on disconnect or on an authenticated `unmute_request`. Setting it False atomically also clears `remote_driving`.
+- `remote_driving` — set True on every remote-driven keystroke, cleared on every physical local keystroke. Strict ping-pong, no timeout. Driven by the WH_KEYBOARD_LL hook in `inputmonitor.py` reading `LLKHF_INJECTED`.
 
-The wedge drops speech only when **both** flags are True. So muting is gated on the user's authorisation AND on the controller actually driving right now.
+The OS-level audio session mute is engaged when `should_drop_speech` is True, which is `muted_by_remote AND remote_driving`. State has a listener registry; `audiomute.py` subscribes and toggles `SetMute` on each transition. So the controller arms muting via `mute_request`, and from then on ping-pong rules: the controlled machine is silent while the controller is driving, audible the moment the local user touches the keyboard, silent again on the next remote keystroke. The mute is fully released on `unmute_request` or on session disconnect.
 
 ### `protocol.py` — the wire authentication
 
-Custom message types ride NVDA Remote's existing TCP transport (see `remoteintegration.py`) but use a string prefix `remoteSpeechControl_` instead of one of NVDA Remote's built-in `RemoteMessageType` enum values. The four types we use:
+Custom message types ride NVDA Remote's existing TCP transport (see `remoteintegration.py`) but use a string prefix `remoteSpeechControl_` instead of one of NVDA Remote's built-in `RemoteMessageType` enum values. The five types we use:
 
 ```
 remoteSpeechControl_capability       # "I have the add-on installed, version N"
@@ -113,36 +117,40 @@ Authentication: PBKDF2-HMAC-SHA256 (100 000 iterations) derives a key from the s
 
 Password never crosses the wire. Wrong password is indistinguishable on the wire from no password configured. Bad MACs are dropped without any acknowledgement so an attacker can't probe.
 
-### `synthwedge.py` — the speech mute mechanism
+### `audiomute.py` — the speech mute mechanism
 
-Wraps the current `SynthDriver.speak` method and re-wraps on `synthDriverHandler.synthChanged` (because changing voice or driver replaces the SynthDriver instance). When `state.should_drop_speech` is True, the wrapper drops the call.
+Toggles the Windows audio session mute flag on NVDA's process via `ISimpleAudioVolume.SetMute`. The COM bindings (`IMMDeviceEnumerator`, `IMMDevice`, `IAudioSessionManager2`, `ISimpleAudioVolume`) are hand-rolled with `comtypes` (which NVDA bundles); no `pycaw` or other vendored dependency. `IAudioSessionManager2.GetSimpleAudioVolume(NULL, 0)` returns the default per-process session directly, so we never enumerate sessions and match on PID.
 
-Why at the synth-driver level rather than at `speech.speak`: NVDA Remote intercepts `speech.speak` upstream, captures the speech sequence, and forwards it to the controller before the call continues into NVDA's normal pipeline. By the time control reaches the active SynthDriver's `speak()` method, NVDA Remote has already shipped the speech to the controller. Dropping at the synth-driver level silences local audio without affecting what the controller hears. Wrapping `speech.speak` instead would also block the upstream forward, which is exactly wrong.
+Registered as a listener on `state.MuteState`. Each transition of `should_drop_speech` fires exactly one `SetMute(True/False)` call, marshalled to the main thread via `wx.CallAfter` so the COM object always lives on a known apartment.
 
-The non-obvious bit: when we drop a `speak` call, we still emit `synthIndexReached` for each `IndexCommand` in the dropped sequence, followed by `synthDoneSpeaking`. NVDA's "say all" (used for reading rich text and HTML continuously) waits for those signals between chunks; without them the say-all stalls in the middle of a chapter. Punctual single-utterance reads (Notepad's line-at-a-time cursor reading) don't notice because they don't queue. This was the root cause of a real bug discovered late in development.
+Why at the Windows-audio-session layer rather than at `speech.speak` or `nvwave.WavePlayer.feed`:
 
-`cancel()` is also wrapped, defensively wrapped in try/except so an exception from our cancel bookkeeping can never prevent the underlying synth cancel from running.
+- Wrapping `speech.speak` would block NVDA Remote's upstream speech-forwarding intercept, which is exactly wrong — the controller needs to hear the controlled side's speech.
+- Wrapping `WavePlayer.feed` and substituting zero-fill bytes was the previous approach (versions 0.5.x – 0.6.12). It worked on some setups but on NVDA 2026.1 / Python 3.13 / WASAPI it perturbed the WavePlayer drain reporting, which races the synth-index callback chain in `speech.sayAll`. Queued `nextLine` callbacks ran after `_TextReader.stop()` had cleared `textInfo`, producing `AttributeError: 'NoneType' object has no attribute 'collapse'` in `sayAll.collapseLineImpl`. The new OS-level mute touches no audio data, the synth runs end-to-end at real timing, every WavePlayer drain event fires on the same schedule as without the addon, and sayAll/Shift-to-pause/Ctrl-to-stop behave identically to addon-not-installed. Only the speakers stop receiving the output.
+
+`uninstall()` always calls `SetMute(False)` unconditionally, because leaving an audio session muted with no UI to undo it is a nightmare for the user to discover.
 
 ### `inputmonitor.py` — physical vs injected keystrokes
 
-NVDA's `_remoteClient` replays remote keystrokes via raw `SendInput()` with no extra-info sentinel, so by the time NVDA's hook sees them they look identical to physical keys at the content level. Windows *itself*, however, sets `LLKHF_INJECTED` in the `KBDLLHOOKSTRUCT.flags` field for any synthesised input.
+NVDA's `_remoteClient` replays remote keystrokes via raw `SendInput()` with no extra-info sentinel, so by the time NVDA's input layer sees them they look identical to physical keys at the content level. Windows *itself*, however, sets `LLKHF_INJECTED` (and `LLKHF_LOWER_IL_INJECTED` for cross-integrity-level injection) in the `KBDLLHOOKSTRUCT.flags` field for any synthesised input.
 
-This module installs a `WH_KEYBOARD_LL` hook via ctypes and reads that flag on every key-down event. Combined with a 300 ms "injection window" opened by `remoteintegration.py` whenever `LocalMachine.sendKey` runs, it attributes keystrokes correctly:
+This module installs a `WH_KEYBOARD_LL` hook via ctypes and reads those flags on every key-down event. Attribution is one-line:
 
-- physical (not injected) → `mark_local_input()` → clear `remote_driving`
-- injected within window → `mark_remote_input()` → set `remote_driving`
-- injected outside window → ignored (some other tool's injection, leave state alone)
+- injected (either flag set) → `mark_remote_input()` → `remote_driving = True`
+- physical (neither flag set) → `mark_local_input()` → `remote_driving = False`
 
-The third case matters because NVDA itself, AutoHotkey, the on-screen keyboard etc. all also produce injected events; without the window gate we'd flicker into "remote driving" whenever NVDA used SendInput internally.
+Result: speech is silenced from the moment a remote keystroke arrives, and restored the moment any physical local keystroke happens. The audiomute listener catches each transition and toggles `SetMute` accordingly.
 
-The hook callback is deliberately tiny and passes everything through via `CallNextHookEx` — it observes, it does not block. Windows enforces a hook callback time limit (`LowLevelHooksTimeout`, default 300 ms); going over it makes Windows silently unhook us, so the callback must stay cheap.
+The hook callback is deliberately tiny: read 4 bytes of flags, one bitwise-and, one `wx.CallAfter` to enqueue the state change on the main thread, then through `CallNextHookEx` and return. Windows enforces `LowLevelHooksTimeout` (default 300 ms); going over it makes Windows silently unhook us, so anything beyond a memory read and an enqueue must NOT happen here. The hook must also never raise — a raised exception in a low-level hook proc drops keystrokes system-wide.
+
+The earlier "300 ms injection window" gate that filtered injected events by whether `LocalMachine.sendKey` had recently run is gone. It was a workaround for a different problem (NVDA's own internal `SendInput` calls firing the hook and being misattributed) that turned out to be self-correcting in practice — those internal injections are bracketed by NVDA's own speech-pause-resume around the same gestures, so a brief mute-flicker during them is invisible. Removing the window simplifies the attribution to one flag check.
 
 ### `remoteintegration.py` — glue into `_remoteClient`
 
 This is the biggest file. It does the following monkey-patches into NVDA's bundled `_remoteClient` package:
 
 1. **`TCPTransport.parse`** — intercepts inbound messages whose `type` field begins with `remoteSpeechControl_` and dispatches to our handlers *before* the original parser tries `RemoteMessageType(obj["type"])` (which would reject and silently drop unknown types). Everything else falls through to the original.
-2. **`LocalMachine.sendKey`** — wraps the controlled-side replay function. Opens the injection-detection window in `inputmonitor` before the original runs. Also short-circuits the call entirely when `_input_frozen_transports` is non-empty (the consent-freeze mechanism described below). The whole pre-action is in try/except so a failure on our side can never drop a key-up event (which would leave a modifier stuck on the remote machine — we had a real bug doing this before adding the try/except).
+2. **`LocalMachine.sendKey`** — wraps the controlled-side replay function. Short-circuits the call entirely when `_input_frozen_transports` is non-empty (the consent-freeze mechanism described below), otherwise hands straight through to the original. The wrap does NOT mark the keystroke for ping-pong attribution — `inputmonitor.py`'s `WH_KEYBOARD_LL` hook reads `LLKHF_INJECTED` on the resulting kernel event and does that job, more accurately (kernel-event truth, not a Python-level scheduling proxy) and as a single attribution path for any injection source.
 3. **`LocalMachine.brailleInput`** — same short-circuit treatment for braille input.
 4. **`RemoteClient.onConnectedAsLeader` / `onConnectedAsFollower` / `onDisconnectedAsLeader` / `onDisconnectedAsFollower`** — hooks the role lifecycle. The earlier approach of patching `Transport.__init__` didn't reliably fire for the `RelayTransport` subclass in current NVDA builds; role callbacks always fire and run *after* the transport is set up, which is exactly the moment we need.
 5. **`RemoteSession.handleClientConnected`** — re-announces our capability whenever a peer joins the channel. Without this, a peer that joins later than us never receives our capability message (NVDA Remote's relay does not replay history). This was another real bug late in development.
@@ -151,7 +159,12 @@ For sending: we bypass the typed `Transport.send` (whose first arg is restricted
 
 **Functions to monkey-patch must use `@functools.wraps(original)`.** NVDA's `extensionPoints.util.callWithSupportedKwargs` filters kwargs based on the callable's `inspect.signature`. Without `functools.wraps`, our wrapper's `*args, **kwargs` signature accepts everything (including kwargs the original doesn't accept), and the original then raises `TypeError`. With `functools.wraps`, inspect.signature follows `__wrapped__` back to the original, and the filter behaves correctly.
 
-**The synth-settings-ring "stay local" feature** is dead simple: NVDA Remote already exposes `RemoteClient.localScripts` as a set of script callables that, when matched during `processKeyInput`, are run locally and NOT forwarded to the remote. We just add the four (six including large-step variants) synth-settings-ring scripts from `globalCommands.commands` to that set when the user has the checkbox ticked, and remove them when it's unticked. No new key hooking required.
+**Local scripts management.** NVDA Remote exposes `RemoteClient.localScripts` as a set of script callables that, when matched during `processKeyInput` on the controller, are run locally and NOT forwarded to the remote as keystrokes. We use this for two things, both reconciled by `apply_local_scripts()`:
+
+* **Persistent local scripts.** Bound script methods registered via `register_persistent_local_script(...)` — at present, just the GlobalPlugin's `script_toggleMute` — are always in `localScripts`. That's what makes `NVDA+shift+m` run on the controller's side instead of being forwarded as a keystroke when the user is F11'd into the controlled machine.
+* **Synth-settings-ring scripts.** Four (six including large-step variants) bound methods on `globalCommands.commands` are added or removed based on the "Synth settings ring adjusts this machine, not the remote" checkbox.
+
+`apply_local_scripts()` runs at install (deferred via `wx.CallAfter` because the `RemoteClient` singleton isn't yet up when we initialise), on every role connect (the `RemoteClient` may have been recreated), on settings save, and on persistent-script registration. `uninstall()` clears both classes of scripts back out of the set before unpatching.
 
 **The consent freeze.** When an authenticated `mute_request` arrives on the controlled side AND `allowAutoMute` is unticked, the transport id is added to `_input_frozen_transports`. The wrapped `sendKey` and `brailleInput` short-circuit while that set is non-empty, so the controller cannot drive the consent dialog themselves. A `consent_pending` message is sent back to the controller; their NVDA announces "Waiting for remote user to allow mute. Remote input is paused." once. The freeze clears the moment the local user resolves the dialog (yes or no) or the transport disconnects.
 
@@ -182,7 +195,7 @@ Standard NVDA `SettingsPanel`. Order of controls, with mnemonics:
 5. Check for updates daily (Alt+U) — checkbox.
 6. Check for updates now (Alt+C) — button.
 7. Verbose logging (Alt+V) — checkbox.
-8. Static text reminding about the force-unmute hotkey.
+8. Static text reminding about the toggle-mute hotkey.
 
 All mnemonics are unique per panel (P, A, M, S, U, C, V).
 

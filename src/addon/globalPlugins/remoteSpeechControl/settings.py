@@ -61,7 +61,7 @@ class RemoteSpeechControlPanel(SettingsPanel):
             wx.StaticText(
                 self,
                 label=(
-                    "The force-unmute hotkey defaults to NVDA+shift+u. "
+                    "The toggle-mute hotkey defaults to NVDA+shift+m. "
                     "Rebind it from NVDA's Input gestures dialog under "
                     "category Remote Speech Control."
                 ),
@@ -96,9 +96,9 @@ class RemoteSpeechControlPanel(SettingsPanel):
         )
         try:
             from . import remoteintegration
-            remoteintegration.apply_keep_synth_ring_local()
+            remoteintegration.apply_local_scripts()
         except Exception:
-            log.exception("rsc: failed applying keep-synth-ring-local after save")
+            log.exception("rsc: failed applying local-scripts after save")
         try:
             from . import selfupdater
             selfupdater.refresh_schedule()

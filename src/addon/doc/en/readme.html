@@ -53,7 +53,7 @@
 <p>A button rather than a setting. Click it to make the add-on check for a newer release immediately, regardless of whether the daily check is enabled. If you previously declined an update, this button will offer it again.</p>
 
 <h3>Verbose logging (Alt+V)</h3>
-<p>Writes detailed activity into NVDA's main log. Useful for diagnosing problems. Default ticked.</p>
+<p>When ticked, the add-on writes its operational activity into NVDA's main log at info level — transport connect, capability exchange, mute toggles, etc. When unticked, only warnings, errors and exceptions are logged. Either way, anything that genuinely went wrong is recorded; the setting just controls whether you also see the moment-to-moment chatter. Default ticked, because reading the log is the main way to diagnose any problem with the add-on.</p>
 
 <h2>Using the mute feature</h2>
 
@@ -76,16 +76,15 @@
 
 <p>If you want to skip the freeze entirely, tick "Allow speech to be automatically muted by controlling machine" on the controlled machine. With that ticked, authenticated mute requests apply immediately and no consent prompt or input freeze ever happens.</p>
 
-<h2>Toggle-mute hotkey</h2>
+<h2>Toggle mute hotkey</h2>
 
-<p>Press <kbd>NVDA+shift+m</kbd> to toggle the controlled machine's mute. The hotkey works from either side of the session and either direction (mutes if currently unmuted, unmutes if currently muted):</p>
+<p>Press <kbd>NVDA+shift+m</kbd> on the controlling machine, while you are F11'd into the controlled machine, to mute or unmute the controlled machine's speech.</p>
 
-<ul>
-<li><strong>On the controlled machine</strong>: toggles its own mute. When pressed to mute, NVDA says "Speech muted" and then goes silent. When pressed again, or when any other physical key is pressed, NVDA says "Speech unmuted" and resumes normal speech. The consent flow does not apply here — you are muting yourself.</li>
-<li><strong>On the controlling machine</strong>: sends an authenticated mute or unmute request to the controlled machine. NVDA on the controller first says "Sending mute request to remote machine" or "Sending unmute request to remote machine", then a moment later says "Remote machine speech muted" / "Remote machine speech unmuted" once the controlled side has acknowledged.</li>
-</ul>
+<p>The hotkey sends the request directly — there is no confirmation dialog on your side, because pressing the hotkey is itself the confirmation, and while you are driving the remote your keystrokes go to it anyway so you couldn't interact with a local dialog. Your NVDA immediately announces "Sending mute request to remote machine" or "Sending unmute request to remote machine" so you know it went out. A moment later, when the controlled side has acted on it, you'll hear the result — "Remote machine speech muted", "Remote machine speech unmuted", or "Remote machine declined the mute request".</p>
 
-<p>The consent flow on the controlled side still applies when a request comes from the controller. If the controlled machine has not ticked Allow speech to be automatically muted, the controlled user is prompted to consent and remote input from the controller is paused until they answer — the controller will hear "Waiting for remote user to allow mute. Remote input is paused." while it waits.</p>
+<p>If the controlled side has not pre-authorised auto-mute, the controlled user is asked to consent to the mute (and remote input is paused on their machine until they answer). Unmute requests never prompt the controlled user — those take effect immediately.</p>
+
+<p>The hotkey is intentionally controlling-side only. The controlled user has no equivalent hotkey by design and does not need one — pressing any key on the controlled keyboard already restores audible speech via ping-pong, and to set a persistent mute the controlled user asks the controller to toggle. The hotkey also does nothing when you are not currently driving the remote (i.e. when you are F11'd back to local control); it will say "Not currently controlling a remote machine".</p>
 
 <p>The shortcut is rebindable. Open the NVDA menu, choose Preferences, then Input gestures, then look under the Remote Speech Control category.</p>
 
@@ -113,7 +112,9 @@
 
 <p>The add-on writes its progress and errors into NVDA's main log. Open the NVDA menu, choose Tools, then View log. Search for lines beginning <code>rsc:</code>.</p>
 
-<p>On a working session you should see, on each machine, lines like "starting up", "nvwave.WavePlayer.feed wrapped", "WH_KEYBOARD_LL hook installed", and "_remoteClient integration installed". When a session connects you should see "transport connected" and "announcing capability". When the two sides have exchanged capability messages you should see "peer capability received".</p>
+<p>Most of the diagnostic chatter below is at info level, which means you only see it with Verbose logging ticked in the settings panel. If you are reading the log to diagnose a problem and not seeing these lines, the most likely reason is Verbose logging is off — turn it on, restart the session, and check the log again.</p>
+
+<p>On a working session you should see, on each machine, lines like "starting up", "OS-level audio session mute armed", "WH_KEYBOARD_LL hook installed for ping-pong attribution", and "_remoteClient integration installed". When a session connects you should see "transport connected" and "announcing capability". When the two sides have exchanged capability messages you should see "peer capability received". When the audio mute toggles you should see "SetMute(True) applied to NVDA audio session" or "SetMute(False) ...".</p>
 
 <p>If muting never happens, the most common cause is the password being different on the two machines. Set it again on both ends and try.</p>
 

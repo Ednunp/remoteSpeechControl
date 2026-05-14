@@ -1,8 +1,9 @@
 """Remote Speech Control global plugin — entry point.
 
-Wires together the synth wedge, input monitor, NVDA Remote integration, and
-settings panel. NVDA instantiates the GlobalPlugin once at startup and calls
-terminate() at shutdown.
+Wires together the audio session mute (OS-level WASAPI SetMute), the
+WH_KEYBOARD_LL ping-pong input monitor, the _remoteClient integration,
+and the settings panel. NVDA instantiates the GlobalPlugin once at
+startup and calls terminate() at shutdown.
 """
 from __future__ import annotations
 
@@ -12,7 +13,6 @@ import wx
 
 from . import logger
 from . import config_spec
-from . import state as state_module
 from . import audiomute
 from . import inputmonitor
 from . import remoteintegration
@@ -20,8 +20,6 @@ from . import selfupdater
 from . import settings as settings_module
 
 log = logger.get()
-
-ADDON_NAME = "remoteSpeechControl"
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -36,6 +34,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         audiomute.install()
         inputmonitor.install()
         remoteintegration.install()
+        # Tell remoteintegration to keep the toggle-mute script local on
+        # the controller. When the user is F11'd into remote-control
+        # mode, NVDA Remote would otherwise forward the keystroke; we
+        # want it handled locally so the yes/no dialog opens here.
+        remoteintegration.register_persistent_local_script(self.script_toggleMute)
         selfupdater.start()
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(
             settings_module.RemoteSpeechControlPanel
@@ -60,46 +63,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         super().terminate()
 
     def script_toggleMute(self, gesture):
-        # Toggles the controlled machine's mute, from either side.
-        #
-        # On the controlling side: sends an authenticated mute_request
-        # or unmute_request depending on the last-known remote state.
-        # The consent flow on the controlled side still applies unless
-        # Allow auto-mute is ticked there.
-        #
-        # On the controlled side: toggles its own mute state. If we are
-        # about to mute, the actual state change is deferred via a
-        # CallbackCommand so the "Speech muted" announcement gets to
-        # play before the audio wedge would silence it.
-        #
-        # Ordinary local keypresses on the controlled side still do the
-        # ping-pong unmute via inputmonitor; this hotkey is the
-        # deliberate toggle that survives until pressed again or until
-        # the controller flips it back.
+        # Controlling-side only. The script is registered into NVDA
+        # Remote's ``localScripts`` so it always runs on whichever
+        # machine the user pressed the key on — never gets forwarded as
+        # a keystroke even when the controller is F11'd into the remote
+        # machine. The action itself is gated on "we are leader AND
+        # currently in remote-control mode (sendingKeys=True)"; otherwise
+        # it speaks a short status message and does nothing.
         try:
-            msg, deferred = remoteintegration.toggle_mute_action()
+            msg = remoteintegration.toggle_mute_action()
         except Exception:
             log.exception("rsc: toggle_mute_action failed")
-            wx.CallAfter(_speak_message, "Toggle mute failed")
-            return
-        if deferred is not None:
-            try:
-                import speech
-                from speech.commands import CallbackCommand
-                speech.speak([msg, CallbackCommand(deferred)])
-                return
-            except Exception:
-                log.exception("rsc: failed scheduling deferred mute via CallbackCommand")
-                # Fall back: announce, then apply mute after a delay.
-                wx.CallAfter(_speak_message, msg)
-                try:
-                    wx.CallLater(1500, deferred)
-                except Exception:
-                    log.exception("rsc: fallback deferred mute also failed")
-        else:
+            msg = "Toggle mute failed"
+        if msg:
             wx.CallAfter(_speak_message, msg)
 
-    script_toggleMute.__doc__ = "Toggles the mute on the controlled machine. Works from either the controller or the controlled side; on the controller the keystroke is sent as an authenticated mute or unmute request and the consent flow on the controlled side still applies."
+    script_toggleMute.__doc__ = "Toggle mute on the controlled machine while you are controlling it. Opens a yes/no dialog and on yes sends a mute or unmute request. Only effective while you are F11'd into the controlled machine."
 
     __gestures = {
         "kb:NVDA+shift+m": "toggleMute",

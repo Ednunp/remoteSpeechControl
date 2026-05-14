@@ -1,38 +1,42 @@
-"""Audio-level mute via nvwave.WavePlayer.feed.
+"""OS-level audio session mute via Windows Core Audio (WASAPI).
 
-When ``state.should_drop_speech`` is True at the moment of a feed call,
-the wrapper substitutes the audio buffer with same-length zero bytes
-(PCM silence) before passing it to NVDA's audio backend. The synth
-still runs to completion at its natural pace: it generates audio
-samples, fills the wave buffer, and NVDA's playback-position callbacks
-(which drive ``synthIndexReached`` and ``synthDoneSpeaking`` for
-say-all) fire at correct real-audio timing because the buffer drains at
-the real sample rate regardless of whether the bytes are zeros or
-real speech.
+Replaces the earlier ``nvwave.WavePlayer.feed`` byte-substitution
+approach. That older wedge zero-filled the audio buffer per chunk, and
+on NVDA 2026.1 / Python 3.13 / WASAPI it perturbed ``WavePlayer``'s
+drain reporting just enough to race the synth-index callback chain in
+``speech.sayAll``: the race fired queued ``nextLine`` callbacks after
+``_TextReader.stop()`` had already cleared ``textInfo``, producing
+this in the log::
 
-NVDA Remote's ``speech.speak`` interception is upstream of audio
-output, so forwarded speech to the controller is unaffected. The mute
-check happens per-feed, so the ping-pong behaviour (mute when remote
-drives / unmute on a local keystroke) is naturally dynamic: the next
-chunk after a state flip is either silenced or audible accordingly,
-with at most one feed-chunk's worth of latency (typically tens of
-milliseconds).
+    File "speech\\sayAll.pyc", line 280, in collapseLineImpl
+    AttributeError: 'NoneType' object has no attribute 'collapse'
 
-Why this is better than wrapping ``synth.speak``
-------------------------------------------------
-NVDA's synth events fire at real-audio-playback timing. Wrapping
-``synth.speak`` at the synth-driver layer means the wedge has to fake
-those timings, which we cannot do correctly across every synth and
-rate — the result was either audible pauses (slow estimate) or
-loss of stop-precision in say-all (fast estimate). Substituting
-silence at the audio-output layer keeps the synth doing real work and
-firing real events on real timings; only the audio device receives
-silence instead of speech. Say-all pacing, stop-on-Shift, and every
-other synth-event-driven behaviour Just Works.
+This module instead toggles the Windows audio session mute flag on
+NVDA's own process via ``ISimpleAudioVolume.SetMute``. The audio data
+flows through WavePlayer unchanged, the synth runs end-to-end at real
+timing, every index fires on the same WavePlayer drain it would have
+fired without the addon — only the speakers stop receiving output.
+Say-all, pause-on-Shift, stop-on-Ctrl all behave identically to
+addon-not-installed.
+
+State integration
+-----------------
+The module registers a listener on ``state.MuteState`` so that any
+transition of ``should_drop_speech`` toggles ``SetMute`` exactly once,
+not per audio chunk. The COM call is marshalled to the main thread via
+``wx.CallAfter`` to avoid threading complications with comtypes objects
+acquired on the wx thread.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+import threading
+from ctypes import POINTER, c_bool, c_float, c_int, c_uint, c_void_p
+from ctypes.wintypes import LPCWSTR
+
+import comtypes
+from comtypes import COMMETHOD, GUID, CLSCTX_ALL, CoCreateInstance, IUnknown
+
+import wx
 
 from . import logger
 from . import state as state_module
@@ -40,55 +44,191 @@ from . import state as state_module
 log = logger.get()
 
 
-_original_feed: Optional[Callable[..., Any]] = None
+# ---------------------------------------------------------------------------
+# Core Audio COM interface bindings — minimum needed to call SetMute on the
+# current process's audio session.
+# ---------------------------------------------------------------------------
+
+CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+
+# EDataFlow
+eRender = 0
+
+# ERole
+eConsole = 0
 
 
-def _patched_feed(self, data, *args, **kwargs):
-    if state_module.state.should_drop_speech and data:
+class ISimpleAudioVolume(IUnknown):
+    _iid_ = GUID("{87CE5498-68D6-44E5-9215-6DA47EF883D8}")
+    _methods_ = [
+        COMMETHOD([], comtypes.HRESULT, "SetMasterVolume",
+                  (["in"], c_float, "fLevel"),
+                  (["in"], POINTER(GUID), "EventContext")),
+        COMMETHOD([], comtypes.HRESULT, "GetMasterVolume",
+                  (["out"], POINTER(c_float), "pfLevel")),
+        COMMETHOD([], comtypes.HRESULT, "SetMute",
+                  (["in"], c_bool, "bMute"),
+                  (["in"], POINTER(GUID), "EventContext")),
+        COMMETHOD([], comtypes.HRESULT, "GetMute",
+                  (["out"], POINTER(c_bool), "pbMute")),
+    ]
+
+
+class IAudioSessionManager2(IUnknown):
+    _iid_ = GUID("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
+    _methods_ = [
+        COMMETHOD([], comtypes.HRESULT, "GetAudioSessionControl",
+                  (["in"], POINTER(GUID), "AudioSessionGuid"),
+                  (["in"], c_uint, "StreamFlags"),
+                  (["out"], POINTER(POINTER(IUnknown)), "SessionControl")),
+        COMMETHOD([], comtypes.HRESULT, "GetSimpleAudioVolume",
+                  (["in"], POINTER(GUID), "AudioSessionGuid"),
+                  (["in"], c_uint, "StreamFlags"),
+                  (["out"], POINTER(POINTER(ISimpleAudioVolume)), "AudioVolume")),
+        # Remaining methods (GetSessionEnumerator, RegisterSessionNotification,
+        # etc.) intentionally omitted — we never call them, and trimming the
+        # vtable here doesn't matter because comtypes only uses _methods_ for
+        # named-method dispatch on this object, not for layout.
+    ]
+
+
+class IMMDevice(IUnknown):
+    _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+    _methods_ = [
+        COMMETHOD([], comtypes.HRESULT, "Activate",
+                  (["in"], POINTER(GUID), "iid"),
+                  (["in"], c_uint, "dwClsCtx"),
+                  (["in"], c_void_p, "pActivationParams"),
+                  (["out"], POINTER(POINTER(IUnknown)), "ppInterface")),
+        COMMETHOD([], comtypes.HRESULT, "OpenPropertyStore",
+                  (["in"], c_uint, "stgmAccess"),
+                  (["out"], POINTER(POINTER(IUnknown)), "ppProperties")),
+        COMMETHOD([], comtypes.HRESULT, "GetId",
+                  (["out"], POINTER(LPCWSTR), "ppstrId")),
+        COMMETHOD([], comtypes.HRESULT, "GetState",
+                  (["out"], POINTER(c_uint), "pdwState")),
+    ]
+
+
+class IMMDeviceEnumerator(IUnknown):
+    _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    _methods_ = [
+        COMMETHOD([], comtypes.HRESULT, "EnumAudioEndpoints",
+                  (["in"], c_int, "dataFlow"),
+                  (["in"], c_uint, "dwStateMask"),
+                  (["out"], POINTER(POINTER(IUnknown)), "ppDevices")),
+        COMMETHOD([], comtypes.HRESULT, "GetDefaultAudioEndpoint",
+                  (["in"], c_int, "dataFlow"),
+                  (["in"], c_int, "role"),
+                  (["out"], POINTER(POINTER(IMMDevice)), "ppEndpoint")),
+        # GetDevice / RegisterEndpointNotificationCallback /
+        # UnregisterEndpointNotificationCallback omitted on purpose.
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Module state
+# ---------------------------------------------------------------------------
+
+_simple_audio_volume = None
+_apply_lock = threading.Lock()
+_listener_registered = False
+
+
+def _acquire_volume():
+    """Lazily acquire ISimpleAudioVolume on the current process's audio session.
+
+    Returns the volume control on success, or None if any COM step
+    failed (in which case we log once and stop trying for the lifetime
+    of this module instance — the user will have to restart NVDA to
+    retry).
+    """
+    global _simple_audio_volume
+    if _simple_audio_volume is not None:
+        return _simple_audio_volume
+    try:
+        enumerator = CoCreateInstance(
+            CLSID_MMDeviceEnumerator,
+            interface=IMMDeviceEnumerator,
+            clsctx=CLSCTX_ALL,
+        )
+        device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
+        session_mgr_unk = device.Activate(
+            IAudioSessionManager2._iid_,
+            CLSCTX_ALL,
+            None,
+        )
+        session_mgr = session_mgr_unk.QueryInterface(IAudioSessionManager2)
+        # Passing AudioSessionGuid=NULL gives us the default per-process
+        # session for our process (nvda.exe). We do not need to enumerate
+        # sessions and match on PID — Windows hands us our own session
+        # directly.
+        volume = session_mgr.GetSimpleAudioVolume(None, 0)
+        _simple_audio_volume = volume
+        log.info("rsc: acquired ISimpleAudioVolume on NVDA audio session")
+        return volume
+    except Exception:
+        log.exception("rsc: failed to acquire audio session volume")
+        return None
+
+
+def _do_set_mute(desired: bool) -> None:
+    """Main-thread COM call. Always runs serialised by _apply_lock."""
+    with _apply_lock:
+        volume = _acquire_volume()
+        if volume is None:
+            return
         try:
-            length = len(data)
-            if length > 0:
-                data = bytes(length)  # zeros: PCM silence for any 16-bit format
-        except (TypeError, ValueError):
-            # data isn't a buffer we can size; leave it alone and let
-            # the original feed handle whatever it is.
-            pass
-    return _original_feed(self, data, *args, **kwargs)
+            volume.SetMute(desired, None)
+            log.info("rsc: SetMute(%s) applied to NVDA audio session", desired)
+        except Exception:
+            log.exception("rsc: SetMute(%s) failed", desired)
+
+
+def _on_state_changed() -> None:
+    """State listener — fires whenever ``state.MuteState`` mutates.
+
+    Schedules the actual ``SetMute`` call on the main thread because the
+    state listener may be invoked from any thread (e.g. the WH_KEYBOARD_LL
+    hook in inputmonitor.py funnels its events through wx.CallAfter, but
+    callers from elsewhere in the addon may not).
+    """
+    desired = state_module.state.should_drop_speech
+    try:
+        wx.CallAfter(_do_set_mute, desired)
+    except Exception:
+        # If wx is unavailable for some reason, fall back to inline. The
+        # COM call should be safe to make from most threads given the
+        # apartment model COM uses for these interfaces, but we'd much
+        # prefer to do it from the main thread.
+        log.exception("rsc: wx.CallAfter unavailable; calling SetMute inline")
+        _do_set_mute(desired)
 
 
 def install() -> None:
-    global _original_feed
-    if _original_feed is not None:
+    global _listener_registered
+    if _listener_registered:
         return
-    try:
-        import nvwave
-    except Exception:
-        log.exception("rsc: nvwave unavailable; audio mute disabled")
-        return
-    cls = getattr(nvwave, "WavePlayer", None)
-    if cls is None or not hasattr(cls, "feed"):
-        log.warning("rsc: nvwave.WavePlayer.feed not found; audio mute disabled")
-        return
-    _original_feed = cls.feed
-    try:
-        cls.feed = _patched_feed
-    except (AttributeError, TypeError):
-        log.exception("rsc: cannot bind feed override on WavePlayer")
-        _original_feed = None
-        return
-    log.info("rsc: nvwave.WavePlayer.feed wrapped; audio mute armed")
+    state_module.state.add_listener(_on_state_changed)
+    _listener_registered = True
+    log.info("rsc: OS-level audio session mute armed")
 
 
 def uninstall() -> None:
-    global _original_feed
-    if _original_feed is None:
-        return
+    global _listener_registered, _simple_audio_volume
+    if _listener_registered:
+        try:
+            state_module.state.remove_listener(_on_state_changed)
+        except Exception:
+            log.exception("rsc: remove_listener failed")
+        _listener_registered = False
+    # Always unmute on shutdown. Leaving the audio session muted would
+    # be a nightmare for the user to discover later, since the addon's
+    # UI wouldn't be there to undo it.
     try:
-        import nvwave
-        cls = getattr(nvwave, "WavePlayer", None)
-        if cls is not None:
-            cls.feed = _original_feed
+        if _simple_audio_volume is not None:
+            _simple_audio_volume.SetMute(False, None)
     except Exception:
-        log.exception("rsc: failed restoring nvwave.WavePlayer.feed")
-    _original_feed = None
-    log.info("rsc: nvwave.WavePlayer.feed unwrapped")
+        log.exception("rsc: cleanup SetMute(False) failed")
+    _simple_audio_volume = None
+    log.info("rsc: OS-level audio session mute disarmed")

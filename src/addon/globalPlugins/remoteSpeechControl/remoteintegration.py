@@ -1,11 +1,11 @@
 """Glue between Remote Speech Control and NVDA's bundled ``_remoteClient`` package.
 
-We make three monkey patches:
+Monkey patches:
 
 1. ``TCPTransport.parse`` — intercept inbound messages whose ``type``
-   begins with our ``remoteSpeechControl_`` prefix and dispatch them to our handlers
-   before the original parser tries ``RemoteMessageType(...)`` (which
-   would reject and drop the message).
+   begins with our ``remoteSpeechControl_`` prefix and dispatch them to our
+   handlers before the original parser tries ``RemoteMessageType(...)``
+   (which would reject and drop the message).
 
 2. ``RemoteClient.onConnectedAsLeader`` / ``onConnectedAsFollower`` /
    ``onDisconnectedAsLeader`` / ``onDisconnectedAsFollower`` — hook our
@@ -15,9 +15,15 @@ We make three monkey patches:
    subclass in current NVDA builds, while the role callbacks are part of
    ``_remoteClient``'s public flow and always run.
 
-3. ``LocalMachine.sendKey`` — open the keystroke-injection window in
-   inputmonitor so the low-level keyboard hook attributes the next
-   injected key correctly.
+3. ``LocalMachine.sendKey`` / ``LocalMachine.brailleInput`` — gate
+   inbound input behind ``_input_frozen_transports`` so the controller
+   cannot answer the controlled side's consent prompt themselves. The
+   ``mark_remote_input`` signal for the ping-pong mute is not emitted
+   from here any more — the WH_KEYBOARD_LL hook in inputmonitor.py
+   catches the injected keystroke directly via ``LLKHF_INJECTED``,
+   which is both more accurate (it sees the real injected event, not
+   merely the call that scheduled it) and a single attribution path
+   for both NVDA Remote and any other injection source.
 
 For sending we bypass the typed ``Transport.send`` (its first arg is
 typed against the closed ``RemoteMessageType`` enum) and write directly
@@ -32,7 +38,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import wx
 
 from . import config_spec
-from . import inputmonitor
 from . import logger
 from . import protocol
 from . import state as state_module
@@ -40,54 +45,53 @@ from . import state as state_module
 log = logger.get()
 
 
+# Kept module-global because ``_running_client()`` reads it on every
+# inbound message and lifecycle event. The other ``_remoteClient`` sub-
+# modules we touch (transport, localMachine, client, session) are only
+# referenced inside ``install()``, so they live as locals there.
 _remote_pkg: Optional[Any] = None
-_transport_module: Optional[Any] = None
-_local_machine_module: Optional[Any] = None
-_client_module: Optional[Any] = None
-_session_module: Optional[Any] = None
 
 _patches: List[Tuple[Any, str, Any]] = []
-_per_transport_disconnect_handlers: Dict[int, Callable[[], None]] = {}
 _nonce_trackers: Dict[int, protocol.NonceTracker] = {}
 _failure_limiters: Dict[int, protocol.FailureLimiter] = {}
 _transport_roles: Dict[int, str] = {}
 _capability_processed: set = set()
 _session_consented_transports: set = set()
 _pending_consent_transports: set = set()
+# Controller-side mirror of the controlled peer's audible-mute state,
+# tracked from inbound MSG_STATE so the toggle-mute hotkey on the
+# controller knows whether to open the "Mute?" or the "Unmute?"
+# confirmation. Keyed by transport id.
+_peer_muted_state: Dict[int, bool] = {}
 # While non-empty, all inbound replay paths on the controlled side
 # (sendKey, brailleInput) are dropped — the controller is locked out
 # of driving the machine until the local user resolves the mute prompt.
 _input_frozen_transports: set = set()
-# Controller-side mirror of what the controlled side has most recently
-# reported as its mute state, so the toggle hotkey knows whether to
-# send mute_request or unmute_request. Updated by _on_state and
-# optimistically on hotkey press.
-_remote_muted_state: Dict[int, bool] = {}
 
 
 def install() -> None:
-    global _remote_pkg, _transport_module, _local_machine_module, _client_module, _session_module
+    global _remote_pkg
     try:
         _remote_pkg = importlib.import_module("_remoteClient")
-        _transport_module = importlib.import_module("_remoteClient.transport")
-        _local_machine_module = importlib.import_module("_remoteClient.localMachine")
-        _client_module = importlib.import_module("_remoteClient.client")
-        _session_module = importlib.import_module("_remoteClient.session")
+        transport_mod = importlib.import_module("_remoteClient.transport")
+        local_machine_mod = importlib.import_module("_remoteClient.localMachine")
+        client_mod = importlib.import_module("_remoteClient.client")
+        session_mod = importlib.import_module("_remoteClient.session")
     except ImportError:
         log.warning("rsc: _remoteClient not present in this NVDA build; pairing disabled")
         return
 
-    _patch(_transport_module.TCPTransport, "parse", _make_patched_parse)
-    _patch(_local_machine_module.LocalMachine, "sendKey", _make_patched_send_key)
-    if hasattr(_local_machine_module.LocalMachine, "brailleInput"):
-        _patch(_local_machine_module.LocalMachine, "brailleInput", _make_patched_braille_input)
+    _patch(transport_mod.TCPTransport, "parse", _make_patched_parse)
+    _patch(local_machine_mod.LocalMachine, "sendKey", _make_patched_send_key)
+    if hasattr(local_machine_mod.LocalMachine, "brailleInput"):
+        _patch(local_machine_mod.LocalMachine, "brailleInput", _make_patched_braille_input)
 
-    if hasattr(_session_module.RemoteSession, "handleClientConnected"):
-        _patch(_session_module.RemoteSession, "handleClientConnected", _make_patched_handle_client_connected)
+    if hasattr(session_mod.RemoteSession, "handleClientConnected"):
+        _patch(session_mod.RemoteSession, "handleClientConnected", _make_patched_handle_client_connected)
     else:
         log.warning("rsc: RemoteSession has no handleClientConnected; late-joiners won't be paired")
 
-    rc_class = _client_module.RemoteClient
+    rc_class = client_mod.RemoteClient
     for attr, is_leader, is_connect in (
         ("onConnectedAsLeader", True, True),
         ("onConnectedAsFollower", False, True),
@@ -109,19 +113,32 @@ def install() -> None:
     # (NVDA initialises us first, then _remoteClient.initialize() runs).
     # Defer until the wx loop is idle so the singleton is ready.
     try:
-        wx.CallAfter(apply_keep_synth_ring_local)
+        wx.CallAfter(apply_local_scripts)
     except Exception:
-        log.exception("rsc: deferred apply_keep_synth_ring_local schedule failed")
+        log.exception("rsc: deferred apply_local_scripts schedule failed")
 
 
 def uninstall() -> None:
+    # Pull our scripts out of NVDA Remote's localScripts BEFORE we unpatch,
+    # so we don't leave bound methods from a GlobalPlugin that's about to
+    # be torn down hanging in there. If addon is later reloaded we re-add
+    # them on the next register/apply cycle.
+    rc = _running_client()
+    if rc is not None:
+        local_scripts = getattr(rc, "localScripts", None)
+        if local_scripts is not None:
+            for s in _persistent_local_scripts:
+                local_scripts.discard(s)
+            for s in _get_synth_ring_scripts():
+                local_scripts.discard(s)
+    _persistent_local_scripts.clear()
+
     while _patches:
         owner, attr, original = _patches.pop()
         try:
             setattr(owner, attr, original)
         except Exception:
             log.exception("rsc: failed restoring %r.%s", owner, attr)
-    _per_transport_disconnect_handlers.clear()
     _nonce_trackers.clear()
     _failure_limiters.clear()
     _transport_roles.clear()
@@ -129,7 +146,7 @@ def uninstall() -> None:
     _session_consented_transports.clear()
     _pending_consent_transports.clear()
     _input_frozen_transports.clear()
-    _remote_muted_state.clear()
+    _peer_muted_state.clear()
     state_module.state.set_muted_by_remote(False)
 
 
@@ -144,9 +161,20 @@ def _patch(owner: Any, attr: str, factory: Callable[[Any], Any]) -> None:
 # Inbound interception
 # ---------------------------------------------------------------------------
 
+_PREFIX_BYTES = protocol.CUSTOM_TYPE_PREFIX.encode("utf-8")
+
+
 def _make_patched_parse(original: Callable[..., Any]) -> Callable[..., Any]:
+    # Fast pre-filter: if the raw bytes don't even contain our prefix
+    # substring, it can't be one of our custom messages. Skip the
+    # deserialize and hand straight to the original parse — this keeps
+    # the per-message overhead near zero for the dominant traffic
+    # (SPEAK forwards during say-all). Only when our prefix appears
+    # somewhere in the line do we deserialize to confirm and dispatch.
     @functools.wraps(original)
     def parse(self, line: bytes) -> None:
+        if _PREFIX_BYTES not in line:
+            return original(self, line)
         try:
             obj = self.serializer.deserialize(line)
         except Exception:
@@ -162,15 +190,16 @@ def _make_patched_parse(original: Callable[..., Any]) -> Callable[..., Any]:
 
 
 # ---------------------------------------------------------------------------
-# Outbound + injection-window patches
+# Inbound input gating (consent-freeze)
 # ---------------------------------------------------------------------------
 
 def _make_patched_send_key(original: Callable[..., Any]) -> Callable[..., Any]:
-    # The original sendKey MUST run for every call we receive — a single
-    # missed key-up event leaves a modifier (Shift, Ctrl, Alt) stuck on
-    # the controlled machine. Wrap our pre-action in its own try/except
-    # so an unexpected failure in our injection-window bookkeeping can
-    # never drop the keystroke.
+    # The wrap exists purely to gate inbound key injection while a
+    # consent prompt is pending. We do NOT observe vk_code or otherwise
+    # account for the key here — the WH_KEYBOARD_LL hook in
+    # inputmonitor.py reads ``LLKHF_INJECTED`` on the resulting kernel
+    # event, which is the authoritative source for the ping-pong
+    # attribution.
     @functools.wraps(original)
     def send_key(self, *args, **kwargs):
         if _input_frozen_transports:
@@ -179,13 +208,6 @@ def _make_patched_send_key(original: Callable[..., Any]) -> Callable[..., Any]:
             # has answered, so the controller cannot drive the
             # confirmation dialog themselves.
             return None
-        try:
-            vk = kwargs.get("vk_code")
-            if vk is None and args:
-                vk = args[0]
-            inputmonitor.open_injection_window(vk_code=vk)
-        except Exception:
-            log.exception("rsc: open_injection_window failed; sendKey continuing")
         return original(self, *args, **kwargs)
     return send_key
 
@@ -277,9 +299,9 @@ def _on_role_connected(transport: Any, is_leader: bool) -> None:
     _send_custom(transport, protocol.MSG_CAPABILITY, version=protocol.PROTOCOL_VERSION)
     # Re-apply in case the RemoteClient was recreated since startup.
     try:
-        apply_keep_synth_ring_local()
+        apply_local_scripts()
     except Exception:
-        log.exception("rsc: failed applying keep-synth-ring-local on connect")
+        log.exception("rsc: failed applying local-scripts on connect")
 
 
 def _on_role_disconnected(transport: Any, is_leader: bool) -> None:
@@ -291,7 +313,7 @@ def _on_role_disconnected(transport: Any, is_leader: bool) -> None:
     _session_consented_transports.discard(tid)
     _pending_consent_transports.discard(tid)
     _input_frozen_transports.discard(tid)
-    _remote_muted_state.pop(tid, None)
+    _peer_muted_state.pop(tid, None)
     state_module.state.set_muted_by_remote(False)
     log.info("rsc: %s transport disconnected (id=%x)", role, tid)
 
@@ -484,14 +506,13 @@ def _on_state(transport: Any, muted: Any = False, denied: Any = False, **_: Any)
         return
     tid = id(transport)
     if bool(denied):
-        _remote_muted_state[tid] = False
         msg = "Remote machine declined the mute request"
     elif bool(muted):
-        _remote_muted_state[tid] = True
         msg = "Remote machine speech muted"
+        _peer_muted_state[tid] = True
     else:
-        _remote_muted_state[tid] = False
         msg = "Remote machine speech unmuted"
+        _peer_muted_state[tid] = False
     wx.CallAfter(_announce, msg)
 
 
@@ -558,6 +579,34 @@ _SYNTH_RING_SCRIPT_NAMES = (
     "script_decreaseLargeSynthSetting",
 )
 
+# Scripts that should always run locally on the controller, never be
+# forwarded to the controlled side. Registered by callers (typically the
+# GlobalPlugin) via ``register_persistent_local_script``; rolled into
+# the RemoteClient's ``localScripts`` set every time ``apply_local_scripts``
+# runs.
+_persistent_local_scripts: List[Any] = []
+
+
+def register_persistent_local_script(script: Any) -> None:
+    """Add a bound script method to the always-local set.
+
+    Use this for scripts whose forwarded-to-remote variant is wrong — e.g.
+    the toggle-mute hotkey: pressing it on the controller should always
+    open the controller's yes/no dialog and send an authenticated request,
+    never get forwarded to the controlled side and run with controlled-side
+    semantics.
+
+    Idempotent. Triggers an ``apply_local_scripts`` so the registration
+    takes effect immediately if the RemoteClient is already up.
+    """
+    if script in _persistent_local_scripts:
+        return
+    _persistent_local_scripts.append(script)
+    try:
+        wx.CallAfter(apply_local_scripts)
+    except Exception:
+        log.exception("rsc: deferred apply_local_scripts after registration failed")
+
 
 def _get_synth_ring_scripts() -> List[Any]:
     """Return the bound methods on NVDA's GlobalCommands singleton that
@@ -582,35 +631,26 @@ def _get_synth_ring_scripts() -> List[Any]:
     return scripts
 
 
-def _get_our_local_scripts() -> List[Any]:
-    """Return the bound methods of our own GlobalPlugin that should
-    always run locally on the controlling side rather than being
-    forwarded to the controlled. Currently just script_toggleMute, so
-    pressing the mute hotkey on the controller sends a proper
-    authenticated mute/unmute request (with consent flow) rather than
-    being forwarded as a raw keystroke."""
-    scripts: List[Any] = []
-    try:
-        import globalPluginHandler
-        for plugin in globalPluginHandler.runningPlugins:
-            mod = type(plugin).__module__
-            if mod == "globalPlugins.remoteSpeechControl" or mod.startswith("globalPlugins.remoteSpeechControl."):
-                s = getattr(plugin, "script_toggleMute", None)
-                if s is not None:
-                    scripts.append(s)
-    except Exception:
-        log.exception("rsc: error finding our plugin's local scripts")
-    return scripts
-
-
 def apply_local_scripts() -> None:
-    """Populate the running RemoteClient's ``localScripts`` set with our
-    own scripts plus (optionally) NVDA's synth-settings-ring scripts per
-    the user's setting.
+    """Reconcile the running RemoteClient's ``localScripts`` set with our
+    requirements.
 
-    NVDA Remote's ``processKeyInput`` already runs ``localScripts``
-    entries on the local machine and skips forwarding them to the
-    remote — we just maintain membership of that set."""
+    Two sources of "local" scripts:
+
+    1. Persistent scripts registered via ``register_persistent_local_script``
+       — always added. Used by the toggle-mute hotkey so that even when the
+       controller is F11'd into remote-control mode, pressing the hotkey
+       runs the controller-side script (opens the yes/no dialog) instead
+       of being forwarded as a keystroke to the controlled side.
+
+    2. The synth-settings-ring scripts — added only if the user has the
+       "Synth settings ring adjusts this machine, not the remote" setting
+       ticked.
+
+    NVDA Remote's ``processKeyInput`` already runs ``localScripts`` entries
+    on the local machine and skips forwarding them, so reconciling this
+    set is all we need to do.
+    """
     rc = _running_client()
     if rc is None:
         log.debug("rsc: apply_local_scripts — no running client yet")
@@ -619,89 +659,78 @@ def apply_local_scripts() -> None:
     if local_scripts is None:
         log.warning("rsc: RemoteClient has no localScripts attribute")
         return
-    # Our own scripts: always local-only.
-    for s in _get_our_local_scripts():
+    # Persistent scripts — always local.
+    for s in _persistent_local_scripts:
         local_scripts.add(s)
-    # Optional synth-settings-ring scripts: gated on user setting.
-    ring_scripts = _get_synth_ring_scripts()
-    if not ring_scripts:
+    if _persistent_local_scripts:
+        log.info("rsc: %d persistent local script(s) registered", len(_persistent_local_scripts))
+    # Conditional: synth settings ring.
+    scripts = _get_synth_ring_scripts()
+    if not scripts:
         return
     if config_spec.get_keep_synth_settings_ring_local():
-        for s in ring_scripts:
+        for s in scripts:
             local_scripts.add(s)
-        log.info("rsc: %d synth-settings-ring scripts kept local", len(ring_scripts))
+        log.info("rsc: %d synth-settings-ring scripts kept local", len(scripts))
     else:
-        for s in ring_scripts:
+        for s in scripts:
             local_scripts.discard(s)
         log.info("rsc: synth-settings-ring scripts allowed to forward to remote")
 
 
-def apply_keep_synth_ring_local() -> None:
-    """Backward-compat alias for apply_local_scripts."""
-    apply_local_scripts()
+def toggle_mute_action() -> str:
+    """Handle the toggle-mute hotkey on the controlling side.
 
+    The hotkey is meaningful only when:
 
-def toggle_mute_action() -> Tuple[str, Optional[Callable[[], None]]]:
-    """Handle the toggle-mute hotkey from whichever side fired it.
+    * we have an active leader transport (we are controlling someone), and
+    * we are currently in remote-control mode (NVDA Remote's
+      ``RemoteClient.sendingKeys`` flag is True, i.e. the user has F11'd
+      into the controlled machine).
 
-    Returns ``(message_to_announce, deferred_action)``.
+    Under those conditions, sends an authenticated mute_request or
+    unmute_request directly — no confirmation dialog on the controller
+    side, because (a) pressing the hotkey is already the confirmation,
+    and (b) while the user is F11'd in, their keystrokes go to the
+    remote machine, so they couldn't navigate a local dialog anyway.
 
-    - On the controlling side (we have an active leader transport):
-      send an authenticated mute_request or unmute_request based on
-      what we last saw the remote report. The actual "Remote machine
-      speech muted/unmuted" announcement fires later when MSG_STATE
-      arrives back. Returns no deferred action.
-    - On the controlled side (we have an active follower transport),
-      currently unmuted: defer the local mute via the returned callable
-      so the "Speech muted" announcement plays *before* the mute takes
-      effect — otherwise our audio wedge would silence its own
-      confirmation.
-    - On the controlled side, currently muted: clear the local mute
-      immediately and tell the controller via MSG_STATE. No deferred
-      action needed (announcement is now audible).
-    - No active session: toggle local mute state defensively, same
-      pattern as above.
+    Mute direction is chosen from ``_peer_muted_state``, our mirror of
+    the controlled side's mute state from inbound ``MSG_STATE``
+    acknowledgements. The controlled side's consent flow still applies
+    to mute requests; if the user there hasn't ticked "Allow auto-mute",
+    they'll see the standard yes/no prompt and remote input will freeze
+    until they answer. Unmute requests are applied immediately by the
+    controlled side with no prompt.
+
+    Returns a short status announcement: "Sending mute request..." or
+    "Sending unmute request...", or a no-op explanation when the hotkey
+    doesn't apply (no session / not in remote-control mode). The
+    eventual result of the request is separately announced when the
+    controlled side's ``MSG_STATE`` reply arrives.
+
+    By design the controlled side has no hotkey: the controlled user
+    unmutes themselves implicitly by pressing any key (ping-pong via the
+    LL hook). To mute, they ask the controller to toggle.
     """
     rc = _running_client()
-    leader = getattr(rc, "leaderTransport", None) if rc is not None else None
-    follower = getattr(rc, "followerTransport", None) if rc is not None else None
+    if rc is None:
+        return "No remote session"
+    leader = getattr(rc, "leaderTransport", None)
+    if leader is None or not getattr(leader, "connected", False):
+        return "Not currently controlling a remote machine"
+    if not bool(getattr(rc, "sendingKeys", False)):
+        # We're connected as leader but not currently driving — F11'd
+        # back to local control. Per the user's design: hotkey is a
+        # no-op in this state.
+        return "Not currently controlling a remote machine"
 
-    # Controlling side: send an authenticated request to the remote.
-    if leader is not None and getattr(leader, "connected", False):
-        tid = id(leader)
-        currently_muted = _remote_muted_state.get(tid, False)
-        if currently_muted:
-            _send_unmute_request(leader)
-            _remote_muted_state[tid] = False  # optimistic
-            log.info("rsc: toggle-mute on leader; sent unmute_request")
-            return ("Sending unmute request to remote machine", None)
-        else:
-            _send_mute_request(leader)
-            _remote_muted_state[tid] = True  # optimistic
-            log.info("rsc: toggle-mute on leader; sent mute_request")
-            return ("Sending mute request to remote machine", None)
-
-    # Controlled side, or no session: toggle local mute state.
-    if state_module.state.muted_by_remote:
-        state_module.state.set_muted_by_remote(False)
-        if follower is not None and getattr(follower, "connected", False):
-            try:
-                _send_custom(follower, protocol.MSG_STATE, muted=False)
-            except Exception:
-                log.exception("rsc: failed sending state after self-unmute")
-        log.info("rsc: toggle-mute on follower; cleared local mute")
-        return ("Speech unmuted", None)
-
-    # Not currently muted — apply mute, but defer until the announcement
-    # has played, so the user actually hears the confirmation.
-    def deferred_mute() -> None:
-        state_module.state.set_muted_by_remote(True)
-        state_module.state.mark_remote_input()
-        if follower is not None and getattr(follower, "connected", False):
-            try:
-                _send_custom(follower, protocol.MSG_STATE, muted=True)
-            except Exception:
-                log.exception("rsc: failed sending state after self-mute")
-        log.info("rsc: toggle-mute on follower; set local mute (deferred)")
-
-    return ("Speech muted", deferred_mute)
+    tid = id(leader)
+    currently_muted = _peer_muted_state.get(tid, False)
+    if currently_muted:
+        log.info("rsc: toggle-mute hotkey; sending unmute_request")
+        _send_unmute_request(leader)
+        return "Sending unmute request to remote machine"
+    else:
+        log.info("rsc: toggle-mute hotkey; sending mute_request")
+        _send_mute_request(leader)
+        return "Sending mute request to remote machine"

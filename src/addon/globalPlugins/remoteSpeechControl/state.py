@@ -1,15 +1,31 @@
 """Mute state machine for the controlled side.
 
+Two flags drive ``should_drop_speech``:
+
 muted_by_remote
     True when a controller has successfully armed muting via an authenticated
-    request. Cleared on successful unmute_request, on session disconnect, or
-    by the local force-unmute hotkey.
+    ``mute_request``. Cleared on a successful ``unmute_request`` or on session
+    disconnect. While set, audio is muted in conjunction with
+    ``remote_driving`` — that's the ping-pong path.
 
 remote_driving
-    True between a remote-injected keyboard gesture and the next physical
-    local key. Ping-pongs strictly with no decay.
+    True between a remote-injected keystroke and the next physical local
+    keystroke. Ping-pongs strictly: the WH_KEYBOARD_LL hook in
+    inputmonitor.py reads ``KBDLLHOOKSTRUCT.flags`` for each event and flips
+    this either way on every keydown. There is no decay timer. Also cleared
+    whenever ``muted_by_remote`` goes False, so a session disconnect drops
+    both flags atomically.
 
-A speak() call is dropped iff both flags are True at the moment of the call.
+A speak call is silenced (via OS-level audio session mute, see audiomute.py)
+when ``should_drop_speech`` is True, i.e. iff both flags are set. Listeners
+on this state see every transition and toggle ``ISimpleAudioVolume.SetMute``
+exactly on those transitions.
+
+The controlled side has no local mute hotkey by design — there's nothing for
+the local user to do that ping-pong doesn't already cover. Any physical
+keypress unmutes immediately via the LL hook; to mute persistently the user
+asks the controller (via the controller's toggle-mute hotkey), who sends a
+``mute_request``.
 """
 from __future__ import annotations
 
