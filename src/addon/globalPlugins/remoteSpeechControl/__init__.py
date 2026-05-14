@@ -13,7 +13,7 @@ import wx
 from . import logger
 from . import config_spec
 from . import state as state_module
-from . import synthwedge
+from . import audiomute
 from . import inputmonitor
 from . import remoteintegration
 from . import selfupdater
@@ -33,7 +33,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         log.info("rsc: starting up")
         config_spec.install()
         logger.configure_verbosity(config_spec.get_verbose())
-        synthwedge.install()
+        audiomute.install()
         inputmonitor.install()
         remoteintegration.install()
         selfupdater.start()
@@ -56,29 +56,53 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             log.exception("rsc: selfupdater.stop failed")
         remoteintegration.uninstall()
         inputmonitor.uninstall()
-        synthwedge.uninstall()
+        audiomute.uninstall()
         super().terminate()
 
-    def script_forceUnmute(self, gesture):
-        # Drops the muted-by-remote state entirely. The next mute_request from
-        # the controller is required to re-arm; ordinary local keypresses do
-        # the gentler ping-pong unmute via inputmonitor.
-        s = state_module.state
-        was = s.muted_by_remote
-        s.set_muted_by_remote(False)
-        if was:
+    def script_toggleMute(self, gesture):
+        # Toggles the controlled machine's mute, from either side.
+        #
+        # On the controlling side: sends an authenticated mute_request
+        # or unmute_request depending on the last-known remote state.
+        # The consent flow on the controlled side still applies unless
+        # Allow auto-mute is ticked there.
+        #
+        # On the controlled side: toggles its own mute state. If we are
+        # about to mute, the actual state change is deferred via a
+        # CallbackCommand so the "Speech muted" announcement gets to
+        # play before the audio wedge would silence it.
+        #
+        # Ordinary local keypresses on the controlled side still do the
+        # ping-pong unmute via inputmonitor; this hotkey is the
+        # deliberate toggle that survives until pressed again or until
+        # the controller flips it back.
+        try:
+            msg, deferred = remoteintegration.toggle_mute_action()
+        except Exception:
+            log.exception("rsc: toggle_mute_action failed")
+            wx.CallAfter(_speak_message, "Toggle mute failed")
+            return
+        if deferred is not None:
             try:
-                remoteintegration.request_unmute_for_active_session()
+                import speech
+                from speech.commands import CallbackCommand
+                speech.speak([msg, CallbackCommand(deferred)])
+                return
             except Exception:
-                log.exception("rsc: notifying peer of force-unmute failed")
-            wx.CallAfter(_speak_message, "Speech force unmuted")
+                log.exception("rsc: failed scheduling deferred mute via CallbackCommand")
+                # Fall back: announce, then apply mute after a delay.
+                wx.CallAfter(_speak_message, msg)
+                try:
+                    wx.CallLater(1500, deferred)
+                except Exception:
+                    log.exception("rsc: fallback deferred mute also failed")
         else:
-            wx.CallAfter(_speak_message, "Speech is not currently muted")
+            wx.CallAfter(_speak_message, msg)
 
-    script_forceUnmute.__doc__ = "Forces Remote Speech Control off; controller must re-arm to mute again."
+    script_toggleMute.__doc__ = "Toggles the mute on the controlled machine. Works from either the controller or the controlled side; on the controller the keystroke is sent as an authenticated mute or unmute request and the consent flow on the controlled side still applies."
 
     __gestures = {
-        "kb:NVDA+shift+u": "forceUnmute",
+        "kb:NVDA+shift+m": "toggleMute",
     }
 
 

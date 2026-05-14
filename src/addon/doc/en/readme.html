@@ -76,9 +76,16 @@
 
 <p>If you want to skip the freeze entirely, tick "Allow speech to be automatically muted by controlling machine" on the controlled machine. With that ticked, authenticated mute requests apply immediately and no consent prompt or input freeze ever happens.</p>
 
-<h2>Force-unmute</h2>
+<h2>Toggle-mute hotkey</h2>
 
-<p>If you arrive at the controlled machine and want to fully release the mute, so that the controller would have to make a new request before muting again, press <kbd>NVDA+shift+u</kbd>. This unmutes immediately and forgets the consent you gave for this session.</p>
+<p>Press <kbd>NVDA+shift+m</kbd> to toggle the controlled machine's mute. The hotkey works from either side of the session and either direction (mutes if currently unmuted, unmutes if currently muted):</p>
+
+<ul>
+<li><strong>On the controlled machine</strong>: toggles its own mute. When pressed to mute, NVDA says "Speech muted" and then goes silent. When pressed again, or when any other physical key is pressed, NVDA says "Speech unmuted" and resumes normal speech. The consent flow does not apply here — you are muting yourself.</li>
+<li><strong>On the controlling machine</strong>: sends an authenticated mute or unmute request to the controlled machine. NVDA on the controller first says "Sending mute request to remote machine" or "Sending unmute request to remote machine", then a moment later says "Remote machine speech muted" / "Remote machine speech unmuted" once the controlled side has acknowledged.</li>
+</ul>
+
+<p>The consent flow on the controlled side still applies when a request comes from the controller. If the controlled machine has not ticked Allow speech to be automatically muted, the controlled user is prompted to consent and remote input from the controller is paused until they answer — the controller will hear "Waiting for remote user to allow mute. Remote input is paused." while it waits.</p>
 
 <p>The shortcut is rebindable. Open the NVDA menu, choose Preferences, then Input gestures, then look under the Remote Speech Control category.</p>
 
@@ -106,7 +113,7 @@
 
 <p>The add-on writes its progress and errors into NVDA's main log. Open the NVDA menu, choose Tools, then View log. Search for lines beginning <code>rsc:</code>.</p>
 
-<p>On a working session you should see, on each machine, lines like "starting up", "wrapped synth speak", "WH_KEYBOARD_LL hook installed", and "_remoteClient integration installed". When a session connects you should see "transport connected" and "announcing capability". When the two sides have exchanged capability messages you should see "peer capability received".</p>
+<p>On a working session you should see, on each machine, lines like "starting up", "nvwave.WavePlayer.feed wrapped", "WH_KEYBOARD_LL hook installed", and "_remoteClient integration installed". When a session connects you should see "transport connected" and "announcing capability". When the two sides have exchanged capability messages you should see "peer capability received".</p>
 
 <p>If muting never happens, the most common cause is the password being different on the two machines. Set it again on both ends and try.</p>
 
