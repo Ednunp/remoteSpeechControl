@@ -78,10 +78,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if msg:
             wx.CallAfter(_speak_message, msg)
 
-    script_toggleMute.__doc__ = "Toggle mute on the controlled machine while you are controlling it. Opens a yes/no dialog and on yes sends a mute or unmute request. Only effective while you are F11'd into the controlled machine."
+    script_toggleMute.__doc__ = "Toggle mute on the controlled machine while you are controlling it. Sends a mute or unmute request directly (no confirmation dialog). Only effective while you are F11'd into the controlled machine."
 
     __gestures = {
-        "kb:NVDA+shift+m": "toggleMute",
+        "kb:NVDA+control+shift+m": "toggleMute",
     }
 
 

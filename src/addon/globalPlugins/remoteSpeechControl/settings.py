@@ -61,7 +61,7 @@ class RemoteSpeechControlPanel(SettingsPanel):
             wx.StaticText(
                 self,
                 label=(
-                    "The toggle-mute hotkey defaults to NVDA+shift+m. "
+                    "The toggle-mute hotkey defaults to NVDA+control+shift+m. "
                     "Rebind it from NVDA's Input gestures dialog under "
                     "category Remote Speech Control."
                 ),
