@@ -6,7 +6,7 @@ This document has two parts. Part 1 is the technical handover for the add-on its
 
 - **GitHub repo:** <https://github.com/Ednunp/remoteSpeechControl>
 - **Releases:** <https://github.com/Ednunp/remoteSpeechControl/releases>
-- **Latest store submission:** <https://github.com/nvaccess/addon-datastore/issues/9147> (v0.5.0)
+- **Latest store submission:** <https://github.com/nvaccess/addon-datastore/issues/9173> (v0.7.4)
 - **Local working tree (out of Dropbox):** `D:\proj\remoteSpeechControl\`
 - **GPL-2.0 licence**, NVDA 2024.1 — 2026.1, internal addonId `remoteSpeechControl`, log prefix `rsc:`, config section `[remoteSpeechControl]` in `nvda.ini`.
 
