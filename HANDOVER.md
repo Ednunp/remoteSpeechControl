@@ -21,7 +21,7 @@ Two related features for NVDA Remote sessions.
 1. **Mutes local speech on the controlled machine** while a remote keyboard is driving NVDA. The instant a real key is pressed on the controlled machine itself, speech resumes; it mutes again on the next remote keystroke ("ping-pong"). This solves the doubled-audio problem when something else is also forwarding the controlled machine's sound back to the controller — without that, the user hears two voices a fraction of a second out of sync.
 2. **Keeps NVDA's synth settings ring on the local NVDA** while in remote control mode, so the rate/pitch/volume keys adjust the synth the user actually hears rather than the remote one they don't.
 
-Plus a self-updater that polls GitHub Releases once a day if the user opts in.
+Updates ride NVDA's Add-on Store. There is no in-addon self-updater — there used to be one (versions 0.5.x – 0.7.5), useful while the addon wasn't yet in the store, but it was removed in 0.7.6 as redundant with the store's own update mechanism.
 
 ## Project layout
 
@@ -39,7 +39,6 @@ D:\proj\remoteSpeechControl\
       audiomute.py                            # OS-level WASAPI session mute (ISimpleAudioVolume.SetMute)
       inputmonitor.py                         # WH_KEYBOARD_LL hook for ping-pong attribution
       remoteintegration.py                    # patches into NVDA's _remoteClient
-      selfupdater.py                          # daily GitHub release poll
       settings.py                             # Settings panel
   build.py                                    # produces dist/remoteSpeechControl-X.Y.Z.nvda-addon
   README.md                                   # public README rendered on GitHub
@@ -61,7 +60,6 @@ config_spec.install()         # register our section in NVDA's config schema
 audiomute.install()           # arm OS-level WASAPI mute via state listener
 inputmonitor.install()        # install WH_KEYBOARD_LL hook for ping-pong
 remoteintegration.install()   # patch _remoteClient
-selfupdater.start()           # schedule daily update check (if enabled)
 gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(RemoteSpeechControlPanel)
 ```
 
@@ -84,9 +82,6 @@ Registers a `[remoteSpeechControl]` section in NVDA's config schema (`config.con
 "autoRequestOnConnect": "boolean(default=False)",
 "allowAutoMute": "boolean(default=False)",
 "keepSynthSettingsRingLocal": "boolean(default=False)",
-"autoUpdateCheck": "boolean(default=False)",
-"lastUpdateCheckMs": "integer(default=0)",
-"snoozedUpdateVersion": "string(default='')",
 "verboseLogging": "boolean(default=True)",
 ```
 
@@ -170,20 +165,6 @@ For sending: we bypass the typed `Transport.send` (whose first arg is restricted
 
 The "Allow speech to be automatically muted" checkbox on the controlled side bypasses both the prompt and the freeze. That's the escape hatch for legitimate unattended remote control of one's own machines.
 
-### `selfupdater.py` — the daily update poll
-
-Polls `api.github.com/repos/Ednunp/remoteSpeechControl/releases/latest` once a day (when opted in), compares the released tag to the installed addon version using a proper tuple-of-ints comparator (`0.4.10` correctly > `0.4.2`), and offers to download and install a newer `.nvda-addon` from the release's assets.
-
-Defensive shape:
-
-- HTTP runs on a daemon worker thread; UI is touched only via `wx.CallAfter` back to the main thread.
-- All filesystem and network exceptions caught; nothing crashes NVDA.
-- A "no" answer is persisted per-version (`snoozedUpdateVersion` in config). Manual "Check now" bypasses the snooze.
-- Manifest name on the downloaded bundle is verified before install — an unexpected URL serving a different add-on cannot replace ours.
-- Failed download or install leaves the previous installation untouched.
-
-Module-level singleton API: `start()`, `stop()`, `check_now(interactive=True)`, `refresh_schedule()`. `start` and `stop` are called from `GlobalPlugin.__init__` / `terminate`. `check_now` is called from the Settings-panel button. `refresh_schedule` is called from the Settings-panel `onSave` so toggling the daily-check setting takes effect immediately.
-
 ### `settings.py` — the panel
 
 Standard NVDA `SettingsPanel`. Order of controls, with mnemonics:
@@ -192,12 +173,10 @@ Standard NVDA `SettingsPanel`. Order of controls, with mnemonics:
 2. Auto-request mute when I connect as controller (Alt+A) — checkbox.
 3. Allow speech to be automatically muted by controlling machine (Alt+M) — checkbox.
 4. Synth settings ring adjusts this machine, not the remote (Alt+S) — checkbox.
-5. Check for updates daily (Alt+U) — checkbox.
-6. Check for updates now (Alt+C) — button.
-7. Verbose logging (Alt+V) — checkbox.
-8. Static text reminding about the toggle-mute hotkey.
+5. Verbose logging (Alt+V) — checkbox.
+6. Static text reminding about the toggle-mute hotkey.
 
-All mnemonics are unique per panel (P, A, M, S, U, C, V).
+All mnemonics are unique per panel (P, A, M, S, V).
 
 ## Build / install
 

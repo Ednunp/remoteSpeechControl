@@ -27,7 +27,9 @@ NVDA menu → Preferences → Settings → Remote Speech Control.
 - **Auto-request mute when I connect as controller** — when ticked, automatically requests muting as soon as a session connects, instead of prompting you to confirm first. Default off.
 - **Allow speech to be automatically muted by controlling machine** — when ticked, the controlled side accepts authenticated mute requests without prompting and without freezing input. When unticked (the default), you are prompted for consent on the controlled machine and all remote input from the controller is paused until you answer.
 - **Synth settings ring adjusts this machine, not the remote** — when ticked, NVDA's synth settings ring keys are routed to your local NVDA while you are in remote control mode, instead of being forwarded to the remote. Default off.
-- **Verbose logging** — writes detailed activity into NVDA's log under `rsc:` lines. Useful for diagnosing problems. Default on.
+- **Verbose logging** — when ticked, writes the add-on's operational activity into NVDA's log under `rsc:` lines. Useful for diagnosing problems. Default on.
+
+Updates are handled by NVDA's Add-on Store. There is no built-in self-updater.
 
 The toggle-mute hotkey is `NVDA+control+shift+m` by default, on the controlling side only and active while you are F11'd into the remote machine. It sends a mute or unmute request directly to the controlled side — no confirmation dialog. The controlled user has no equivalent hotkey: pressing any key on the controlled keyboard restores audible speech via ping-pong. Rebindable from NVDA's Input gestures dialog under the Remote Speech Control category.
 

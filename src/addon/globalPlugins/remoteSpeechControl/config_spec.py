@@ -14,9 +14,6 @@ SPEC = {
     "autoRequestOnConnect": "boolean(default=False)",
     "allowAutoMute": "boolean(default=False)",
     "keepSynthSettingsRingLocal": "boolean(default=False)",
-    "autoUpdateCheck": "boolean(default=False)",
-    "lastUpdateCheckMs": "integer(default=0)",
-    "snoozedUpdateVersion": "string(default='')",
     "verboseLogging": "boolean(default=True)",
 }
 
@@ -43,18 +40,3 @@ def get_keep_synth_settings_ring_local() -> bool:
 
 def get_verbose() -> bool:
     return bool(config.conf[SECTION]["verboseLogging"])
-
-
-def get_auto_update_check() -> bool:
-    return bool(config.conf[SECTION]["autoUpdateCheck"])
-
-
-def get_last_update_check_ms() -> int:
-    try:
-        return int(config.conf[SECTION]["lastUpdateCheckMs"])
-    except (TypeError, ValueError):
-        return 0
-
-
-def get_snoozed_update_version() -> str:
-    return str(config.conf[SECTION]["snoozedUpdateVersion"] or "")

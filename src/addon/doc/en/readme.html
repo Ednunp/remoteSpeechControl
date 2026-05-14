@@ -46,12 +46,6 @@
 <h3>Synth settings ring adjusts this machine, not the remote (Alt+S)</h3>
 <p>Controller-side setting. When ticked, pressing NVDA's synth settings ring gestures (move between settings, increase, decrease) while in remote control mode adjusts the local NVDA's voice, rate, pitch, volume and so on, rather than being forwarded to the remote. Default unticked.</p>
 
-<h3>Check for updates daily (Alt+U)</h3>
-<p>When ticked, the add-on quietly checks GitHub once a day for a newer release and prompts you to download and install it if one is available. Default unticked.</p>
-
-<h3>Check for updates now (Alt+C)</h3>
-<p>A button rather than a setting. Click it to make the add-on check for a newer release immediately, regardless of whether the daily check is enabled. If you previously declined an update, this button will offer it again.</p>
-
 <h3>Verbose logging (Alt+V)</h3>
 <p>When ticked, the add-on writes its operational activity into NVDA's main log at info level — transport connect, capability exchange, mute toggles, etc. When unticked, only warnings, errors and exceptions are logged. Either way, anything that genuinely went wrong is recorded; the setting just controls whether you also see the moment-to-moment chatter. Default ticked, because reading the log is the main way to diagnose any problem with the add-on.</p>
 
@@ -93,14 +87,6 @@
 <p>NVDA's synth settings ring (default gestures around NVDA+control or NVDA+control+shift with the arrow keys, depending on your configuration) lets you cycle through synthesiser settings and adjust them. Without this add-on, those keystrokes are forwarded to the remote machine while you are in remote control mode — useless because you are listening to your local speech, not the remote's.</p>
 
 <p>Tick "Synth settings ring adjusts this machine, not the remote" on the controller side and those specific gestures stay local. All other keystrokes still forward to the remote normally. NVDA Remote already had a mechanism for keeping specific scripts local; we just register the four ring scripts (plus the two large-step variants) with it.</p>
-
-<h2>Automatic updates</h2>
-
-<p>If you tick "Check for updates daily", the add-on contacts <code>api.github.com</code> once every 24 hours, asks for the most recent published release, and compares it to the version you have installed. If the release is newer, a yes/no dialog appears: download and install it now? If you click yes, the add-on downloads the new <code>.nvda-addon</code> file straight from the GitHub release, installs it, and prompts you to restart NVDA. If you click no, the same version is not offered again automatically; the next time a newer version appears, you will be asked again.</p>
-
-<p>The Check for updates now button on the settings panel triggers the same check immediately and ignores any previous decline, so you can use it to revisit a version you said no to earlier.</p>
-
-<p>This is independent of NVDA's own Add-on Store, which has its own update mechanism for add-ons installed via the Store. If you installed via the Store, both update paths will be available; whichever notices a new version first wins.</p>
 
 <h2>Security</h2>
 

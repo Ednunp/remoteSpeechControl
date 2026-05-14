@@ -16,7 +16,6 @@ from . import config_spec
 from . import audiomute
 from . import inputmonitor
 from . import remoteintegration
-from . import selfupdater
 from . import settings as settings_module
 
 log = logger.get()
@@ -37,9 +36,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Tell remoteintegration to keep the toggle-mute script local on
         # the controller. When the user is F11'd into remote-control
         # mode, NVDA Remote would otherwise forward the keystroke; we
-        # want it handled locally so the yes/no dialog opens here.
+        # want it handled locally so the request is sent from here.
         remoteintegration.register_persistent_local_script(self.script_toggleMute)
-        selfupdater.start()
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(
             settings_module.RemoteSpeechControlPanel
         )
@@ -53,10 +51,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             )
         except ValueError:
             pass
-        try:
-            selfupdater.stop()
-        except Exception:
-            log.exception("rsc: selfupdater.stop failed")
         remoteintegration.uninstall()
         inputmonitor.uninstall()
         audiomute.uninstall()
