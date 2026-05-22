@@ -315,6 +315,18 @@ def _on_role_disconnected(transport: Any, is_leader: bool) -> None:
     _input_frozen_transports.discard(tid)
     _peer_muted_state.pop(tid, None)
     state_module.state.set_muted_by_remote(False)
+    # Belt-and-braces: in addition to the state-listener path triggered
+    # by set_muted_by_remote(False), directly force-apply SetMute(False)
+    # on a freshly acquired audio-session volume reference. Guards
+    # against the scenario where the listener / wx.CallAfter chain didn't
+    # complete (e.g. because the cached volume reference went stale
+    # mid-session) and the session was left muted past disconnect, which
+    # would leave the controlled machine silent until NVDA restart.
+    try:
+        from . import audiomute
+        wx.CallAfter(audiomute.force_unmute_now)
+    except Exception:
+        log.exception("rsc: deferred force_unmute_now schedule failed")
     log.info("rsc: %s transport disconnected (id=%x)", role, tid)
 
 

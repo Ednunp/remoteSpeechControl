@@ -185,6 +185,38 @@ def _do_set_mute(desired: bool) -> None:
             log.exception("rsc: SetMute(%s) failed", desired)
 
 
+def force_unmute_now() -> None:
+    """Belt-and-braces: directly apply SetMute(False) on a freshly acquired
+    audio session volume reference.
+
+    Used by ``remoteintegration._on_role_disconnected`` to guarantee the
+    audio session is unmuted at session end, regardless of whether the
+    listener-driven path fired or whether our cached volume reference
+    has gone stale (e.g. because the default audio endpoint changed
+    mid-session). Drops the cached reference, re-acquires, calls
+    ``SetMute(False)`` synchronously. Logs every step so failures show
+    up clearly in nvda.log under verbose logging.
+
+    Must be invoked on the main thread (use ``wx.CallAfter`` from
+    anywhere else).
+    """
+    global _simple_audio_volume
+    with _apply_lock:
+        # Drop the cached reference unconditionally — the previous one
+        # may have been acquired against a now-stale endpoint, and we
+        # specifically don't trust it on session-disconnect.
+        _simple_audio_volume = None
+        volume = _acquire_volume()
+        if volume is None:
+            log.warning("rsc: force_unmute_now could not acquire audio session volume")
+            return
+        try:
+            volume.SetMute(False, None)
+            log.info("rsc: force_unmute_now applied SetMute(False) to fresh audio session reference")
+        except Exception:
+            log.exception("rsc: force_unmute_now SetMute(False) failed")
+
+
 def _on_state_changed() -> None:
     """State listener — fires whenever ``state.MuteState`` mutates.
 

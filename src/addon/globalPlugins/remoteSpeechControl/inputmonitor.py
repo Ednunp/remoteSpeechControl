@@ -100,16 +100,28 @@ _hook_proc_ref: object | None = None  # keep the WINFUNCTYPE alive
 def _hook_proc(nCode, wParam, lParam):
     # MUST NOT raise. A raised exception from a low-level hook proc
     # drops keystrokes system-wide.
+    #
+    # Short-circuit when no controller has armed muting on this machine:
+    # the ping-pong attribution is meaningless when ``muted_by_remote``
+    # is False (``should_drop_speech`` can never be True regardless of
+    # ``remote_driving``), and skipping the wx.CallAfter on every system
+    # keystroke removes any conceivable per-key overhead from this
+    # add-on outside of an active muted session. Direct attribute read
+    # without acquiring state._lock — a Python boolean read is atomic
+    # and a stale read is bounded harm (we either skip a keystroke that
+    # would have been a no-op anyway, or fire mark_*_input one keystroke
+    # too late).
     if nCode == HC_ACTION and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-        try:
-            kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT))[0]
-            is_injected = bool(kb.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
-            if is_injected:
-                wx.CallAfter(state_module.state.mark_remote_input)
-            else:
-                wx.CallAfter(state_module.state.mark_local_input)
-        except Exception:
-            pass
+        if state_module.state.muted_by_remote:
+            try:
+                kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT))[0]
+                is_injected = bool(kb.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
+                if is_injected:
+                    wx.CallAfter(state_module.state.mark_remote_input)
+                else:
+                    wx.CallAfter(state_module.state.mark_local_input)
+            except Exception:
+                pass
     return _user32.CallNextHookEx(_hook_handle or 0, nCode, wParam, lParam)
 
 
