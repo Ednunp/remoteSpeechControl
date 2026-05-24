@@ -176,13 +176,44 @@ def _do_set_mute(desired: bool) -> None:
     """Main-thread COM call. Always runs serialised by _apply_lock."""
     with _apply_lock:
         volume = _acquire_volume()
-        if volume is None:
-            return
+        if volume is not None:
+            try:
+                volume.SetMute(desired, None)
+                log.info("rsc: SetMute(%s) applied to NVDA audio session", desired)
+            except Exception:
+                log.exception("rsc: SetMute(%s) failed", desired)
+    # Belt-and-braces: on every transition to audible (desired False),
+    # defensively clear NVDA's speech-cancelled flag. While that flag
+    # is True, ``speech.speakTextInfo``-driven output (edit-field
+    # caret reads, say-all) is silently suppressed even though
+    # ``speakObject`` (focus events) still works — producing the
+    # "edit-field reads silent but focus speech works" symptom. NVDA
+    # Remote already does this defensively before forwarded speech
+    # (its ``setSpeechCancelledToFalse``); we do the same on every
+    # unmute so a stuck flag from a previous session can't survive
+    # into local use.
+    if not desired:
+        _clear_speech_cancelled_flag()
+
+
+def _clear_speech_cancelled_flag() -> None:
+    """Set ``speech._speechState.beenCanceled = False`` defensively.
+
+    The attribute lives in ``speech._speechState`` in older NVDA
+    builds and in ``speech.speech._speechState`` in newer ones (the
+    speech module was split into a package). Try both paths; if
+    neither resolves, silently no-op — this is purely defensive and
+    must never raise.
+    """
+    for module_path in ("speech.speech", "speech"):
         try:
-            volume.SetMute(desired, None)
-            log.info("rsc: SetMute(%s) applied to NVDA audio session", desired)
+            mod = __import__(module_path, fromlist=["_speechState"])
+            speech_state = getattr(mod, "_speechState", None)
+            if speech_state is not None and hasattr(speech_state, "beenCanceled"):
+                speech_state.beenCanceled = False
+                return
         except Exception:
-            log.exception("rsc: SetMute(%s) failed", desired)
+            continue
 
 
 def force_unmute_now() -> None:

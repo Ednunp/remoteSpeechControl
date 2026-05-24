@@ -15,15 +15,30 @@ Monkey patches:
    subclass in current NVDA builds, while the role callbacks are part of
    ``_remoteClient``'s public flow and always run.
 
-3. ``LocalMachine.sendKey`` / ``LocalMachine.brailleInput`` — gate
+3. ``FollowerSession.handleClientDisconnected`` /
+   ``LeaderSession.handleClientDisconnected`` — fires when the *peer*
+   leaves the channel even though the local transport stays open
+   (e.g. the controller closes their NVDA Remote session window but
+   our follower transport is still alive). The role-level disconnect
+   callbacks in (2) only fire on actual transport close, not on
+   peer-leave, so without this hook ``muted_by_remote`` would stay
+   True after the controller has visibly gone away and the controlled
+   side's local user would be unable to clear the mute by typing.
+
+4. ``LocalMachine.sendKey`` / ``LocalMachine.brailleInput`` — gate
    inbound input behind ``_input_frozen_transports`` so the controller
-   cannot answer the controlled side's consent prompt themselves. The
-   ``mark_remote_input`` signal for the ping-pong mute is not emitted
-   from here any more — the WH_KEYBOARD_LL hook in inputmonitor.py
-   catches the injected keystroke directly via ``LLKHF_INJECTED``,
-   which is both more accurate (it sees the real injected event, not
-   merely the call that scheduled it) and a single attribution path
-   for both NVDA Remote and any other injection source.
+   cannot answer the controlled side's consent prompt themselves.
+   ``sendKey`` *also* calls ``state.mark_remote_input()``: this is the
+   authoritative "remote is driving" signal for the ping-pong mute.
+   The LL hook in inputmonitor.py used to attribute injected events
+   to the remote side via ``LLKHF_INJECTED``, but Windows and various
+   text-input layers turn out to echo every physical keystroke with
+   the injected bit set ~30–200 ms later — those phantom echoes
+   toggled the WASAPI mute on and off per local keystroke and
+   chopped edit-field speech to silence. Reading the wrap is much
+   more accurate: it only fires when NVDA Remote is actually
+   replaying a keystroke from the leader on our side, so phantoms
+   from other Windows plumbing can't pretend to be NVDA Remote.
 
 For sending we bypass the typed ``Transport.send`` (its first arg is
 typed against the closed ``RemoteMessageType`` enum) and write directly
@@ -90,6 +105,21 @@ def install() -> None:
         _patch(session_mod.RemoteSession, "handleClientConnected", _make_patched_handle_client_connected)
     else:
         log.warning("rsc: RemoteSession has no handleClientConnected; late-joiners won't be paired")
+
+    # Peer-left disconnect. Each session subclass defines its own
+    # ``handleClientDisconnected``; the base class's method (which we
+    # could otherwise patch once) is overridden in both subclasses, so
+    # patching only the base would never see real peer-leaves. Patch
+    # both subclasses directly.
+    for cls_name in ("FollowerSession", "LeaderSession"):
+        cls = getattr(session_mod, cls_name, None)
+        if cls is None:
+            log.warning("rsc: %s class missing from _remoteClient.session; peer-leave hook skipped", cls_name)
+            continue
+        if hasattr(cls, "handleClientDisconnected"):
+            _patch(cls, "handleClientDisconnected", _make_patched_handle_client_disconnected)
+        else:
+            log.warning("rsc: %s has no handleClientDisconnected; peer-leave hook skipped", cls_name)
 
     rc_class = client_mod.RemoteClient
     for attr, is_leader, is_connect in (
@@ -194,20 +224,27 @@ def _make_patched_parse(original: Callable[..., Any]) -> Callable[..., Any]:
 # ---------------------------------------------------------------------------
 
 def _make_patched_send_key(original: Callable[..., Any]) -> Callable[..., Any]:
-    # The wrap exists purely to gate inbound key injection while a
-    # consent prompt is pending. We do NOT observe vk_code or otherwise
-    # account for the key here — the WH_KEYBOARD_LL hook in
-    # inputmonitor.py reads ``LLKHF_INJECTED`` on the resulting kernel
-    # event, which is the authoritative source for the ping-pong
-    # attribution.
+    # Two jobs:
+    #   1. Gate inbound key injection while a consent prompt is pending,
+    #      so the controller cannot drive the confirmation dialog
+    #      themselves.
+    #   2. Mark ``state.remote_driving = True`` — the authoritative
+    #      "remote is driving" signal for the ping-pong mute. The LL
+    #      hook in inputmonitor.py used to do this via ``LLKHF_INJECTED``
+    #      but Windows / NVDA / text-input layers echo every physical
+    #      keystroke with the injected bit set ~30–200 ms later,
+    #      causing the WASAPI mute to flap on every local keystroke and
+    #      chop edit-field speech to silence. Reading the wrap is much
+    #      more accurate — it only fires when NVDA Remote is actually
+    #      replaying a real keystroke from the leader on this side.
     @functools.wraps(original)
     def send_key(self, *args, **kwargs):
         if _input_frozen_transports:
-            # A consent prompt is pending on this machine; drop all
-            # inbound input from the controller until the local user
-            # has answered, so the controller cannot drive the
-            # confirmation dialog themselves.
             return None
+        try:
+            state_module.state.mark_remote_input()
+        except Exception:
+            log.exception("rsc: mark_remote_input from sendKey wrap failed")
         return original(self, *args, **kwargs)
     return send_key
 
@@ -237,6 +274,36 @@ def _make_patched_handle_client_connected(original: Callable[..., Any]) -> Calla
                 _send_custom(transport, protocol.MSG_CAPABILITY, version=protocol.PROTOCOL_VERSION)
         except Exception:
             log.exception("rsc: re-announce capability on peer join failed")
+        return result
+    return wrapper
+
+
+def _make_patched_handle_client_disconnected(original: Callable[..., Any]) -> Callable[..., Any]:
+    # Fires when the *peer* leaves the session even though our local
+    # transport stays alive (e.g. the controller closes their NVDA
+    # Remote session window without dropping the relay connection).
+    # The role-level RemoteClient.onDisconnectedAs* hooks only fire on
+    # actual transport close, so without this hook ``muted_by_remote``
+    # stays True after the controller is visibly gone, and the
+    # controlled side's local user can't clear the mute by typing.
+    # Clear our session state defensively here — if a new peer joins
+    # next, the normal handleClientConnected path will re-arm anything
+    # that's needed.
+    @functools.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            log.info("rsc: peer left session; clearing local mute state")
+            state_module.state.set_muted_by_remote(False)
+            # Also clear our capability-processed memory for this
+            # transport so the next peer-join exchange is clean.
+            transport = getattr(self, "transport", None)
+            if transport is not None:
+                tid = id(transport)
+                _capability_processed.discard(tid)
+                _peer_muted_state.pop(tid, None)
+        except Exception:
+            log.exception("rsc: clearing mute on peer-leave failed")
         return result
     return wrapper
 
@@ -714,11 +781,13 @@ def toggle_mute_action() -> str:
     until they answer. Unmute requests are applied immediately by the
     controlled side with no prompt.
 
-    Returns a short status announcement: "Sending mute request..." or
-    "Sending unmute request...", or a no-op explanation when the hotkey
-    doesn't apply (no session / not in remote-control mode). The
-    eventual result of the request is separately announced when the
-    controlled side's ``MSG_STATE`` reply arrives.
+    Returns an empty string in the success case — the round-trip is
+    fast enough that the intermediate "sending..." announcement was
+    only ever stepping on the end-state announcement that arrives via
+    ``MSG_STATE``. The user hears just the final "Remote machine speech
+    muted" / "Remote machine speech unmuted" / "Remote machine declined
+    the mute request". Returns a short status string only when the
+    hotkey doesn't apply (no session / not in remote-control mode).
 
     By design the controlled side has no hotkey: the controlled user
     unmutes themselves implicitly by pressing any key (ping-pong via the
@@ -741,8 +810,7 @@ def toggle_mute_action() -> str:
     if currently_muted:
         log.info("rsc: toggle-mute hotkey; sending unmute_request")
         _send_unmute_request(leader)
-        return "Sending unmute request to remote machine"
     else:
         log.info("rsc: toggle-mute hotkey; sending mute_request")
         _send_mute_request(leader)
-        return "Sending mute request to remote machine"
+    return ""
