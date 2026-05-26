@@ -138,6 +138,15 @@ def install() -> None:
         )(attr)
         _patch(rc_class, attr, factory)
 
+    # Wrap processKeyInput so we can pre-empt the local speech queue
+    # when a synth-settings-ring chord is about to schedule its
+    # announcement. See ``_make_patched_process_key_input`` for the
+    # full rationale.
+    if hasattr(rc_class, "processKeyInput"):
+        _patch(rc_class, "processKeyInput", _make_patched_process_key_input)
+    else:
+        log.warning("rsc: RemoteClient has no processKeyInput; synth-ring speech preempt skipped")
+
     log.info("rsc: _remoteClient integration installed")
     # The RemoteClient instance may not yet exist at our install() time
     # (NVDA initialises us first, then _remoteClient.initialize() runs).
@@ -146,6 +155,23 @@ def install() -> None:
         wx.CallAfter(apply_local_scripts)
     except Exception:
         log.exception("rsc: deferred apply_local_scripts schedule failed")
+    # If a session is already live (i.e. the user reloaded plugins during
+    # an active NVDA Remote session), several BoundMethodWeakref entries
+    # in NVDA's extension-point system point to our *previous* incarnation
+    # of the wrappers: the transport's inboundHandlers (KEY, BRAILLE_INPUT,
+    # CLIENT_JOINED, CLIENT_LEFT) and inputCore.decide_handleRawKey (the
+    # leader-side processKeyInput gate). Our just-completed uninstall
+    # dropped the only strong refs to those wrappers, so those weakrefs
+    # are now dead — Action.notify / Decider.decide silently skip them.
+    # That's what makes the controlled machine stop accepting remote
+    # keystrokes after a reload, and (with the processKeyInput patch now
+    # in place) would also break the leader-side forwarding. Rebinding
+    # adds the *current* (post-patch) bound methods alongside the dead
+    # ones; dispatch starts working again on the next event.
+    try:
+        wx.CallAfter(_rebind_dispatch_handlers)
+    except Exception:
+        log.exception("rsc: deferred _rebind_dispatch_handlers schedule failed")
 
 
 def uninstall() -> None:
@@ -245,7 +271,11 @@ def _make_patched_send_key(original: Callable[..., Any]) -> Callable[..., Any]:
             state_module.state.mark_remote_input()
         except Exception:
             log.exception("rsc: mark_remote_input from sendKey wrap failed")
-        return original(self, *args, **kwargs)
+        try:
+            return original(self, *args, **kwargs)
+        except Exception:
+            log.exception("rsc: sendKey original raised")
+            raise
     return send_key
 
 
@@ -419,6 +449,98 @@ def _is_leader_for(transport: Any) -> Optional[bool]:
     if rc.followerTransport is transport:
         return False
     return None
+
+
+# ---------------------------------------------------------------------------
+# processKeyInput wrap — synth-ring speech preemption
+# ---------------------------------------------------------------------------
+#
+# When NVDA Remote leader is F11'd into a follower, every ``SPEAK``
+# forwarded from the follower is queued on the leader's local speech
+# subsystem via ``LocalMachine.speak`` -> ``speech._manager.speak`` at
+# ``Spri.NORMAL`` priority. ``ui.message`` (which the synth-settings-
+# ring scripts use to announce the new setting / value) also speaks at
+# ``Spri.NORMAL`` and does not preempt currently-playing speech. So if
+# a forwarded utterance is being rendered when the user presses
+# NVDA+(shift+)control+arrow, the synth-ring announcement queues behind
+# it, roughly doubling the perceived response time and making it
+# impossible to skim through ring options.
+#
+# Fix: when we detect a synth-ring local-script chord (``gesture.script``
+# is one of the six ``script_*SynthSetting`` names AND it's in
+# ``self.localScripts``), schedule ``speech.cancelSpeech`` via
+# ``wx.CallAfter`` BEFORE the original ``processKeyInput`` schedules
+# its own ``wx.CallAfter(script, gesture)``. ``wx.CallAfter`` is FIFO on
+# the main thread, so the cancel lands first (clearing any forwarded
+# speech in flight) and the script then queues its announcement onto an
+# empty pipeline.
+#
+# Restricted to the synth-ring scripts by name so we never accidentally
+# cancel forwarded speech the user actually wants to hear (e.g. a
+# response announcement after the toggle-mute hotkey, which is also a
+# local script).
+#
+# Cheap vk pre-filter to avoid the gesture construction on every
+# keystroke. Covers the keys all six synth-ring scripts are bound to
+# under NVDA's default desktop and laptop layouts: arrows for the
+# regular increase/decrease/next/prev variants; pageUp/pageDown for the
+# large-step variants.
+_SYNTH_RING_CANDIDATE_VK = frozenset({
+    0x21, 0x22,  # PageUp, PageDown
+    0x25, 0x26, 0x27, 0x28,  # Left, Up, Right, Down
+})
+
+# Synth-settings-ring script names. The wrap pre-empts local speech
+# (via ``speech.cancelSpeech``) when ``gesture.script.__name__`` matches
+# one of these AND the script is in ``self.localScripts``. The same
+# tuple is consumed below by ``_get_synth_ring_scripts`` /
+# ``apply_local_scripts`` to populate ``rc.localScripts`` itself.
+_SYNTH_RING_SCRIPT_NAMES = (
+    "script_nextSynthSetting",
+    "script_previousSynthSetting",
+    "script_increaseSynthSetting",
+    "script_decreaseSynthSetting",
+    "script_increaseLargeSynthSetting",
+    "script_decreaseLargeSynthSetting",
+)
+_SYNTH_RING_PREEMPT_NAMES = frozenset(_SYNTH_RING_SCRIPT_NAMES)
+
+
+def _make_patched_process_key_input(original: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original)
+    def wrapper(self, vkCode=None, scanCode=None, extended=None, pressed=None):
+        # Bail out fast for the overwhelming majority of keystrokes
+        # that can't possibly be a synth-ring chord: not pressed, not
+        # in remote-control mode, or not one of the candidate vk codes.
+        if (
+            pressed
+            and vkCode in _SYNTH_RING_CANDIDATE_VK
+            and getattr(self, "sendingKeys", False)
+        ):
+            try:
+                from keyboardHandler import KeyboardInputGesture
+                gp = KeyboardInputGesture(
+                    self.keyModifiers, vkCode, scanCode, extended,
+                )
+                if not gp.isModifier:
+                    script_p = gp.script
+                    if (
+                        script_p is not None
+                        and getattr(script_p, "__name__", None) in _SYNTH_RING_PREEMPT_NAMES
+                        and script_p in self.localScripts
+                    ):
+                        import speech as _speech_mod
+                        wx.CallAfter(_speech_mod.cancelSpeech)
+            except Exception:
+                log.exception("rsc: synth-ring speech preempt failed")
+        return original(
+            self,
+            vkCode=vkCode,
+            scanCode=scanCode,
+            extended=extended,
+            pressed=pressed,
+        )
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -649,14 +771,10 @@ def _announce(text: str) -> None:
         log.warning("rsc: ui.message failed", exc_info=True)
 
 
-_SYNTH_RING_SCRIPT_NAMES = (
-    "script_nextSynthSetting",
-    "script_previousSynthSetting",
-    "script_increaseSynthSetting",
-    "script_decreaseSynthSetting",
-    "script_increaseLargeSynthSetting",
-    "script_decreaseLargeSynthSetting",
-)
+# _SYNTH_RING_SCRIPT_NAMES is defined near the top of the file
+# (next to the processKeyInput wrap) because that wrap consumes it
+# for synth-ring speech preemption. ``_get_synth_ring_scripts`` /
+# ``apply_local_scripts`` below reference the same tuple.
 
 # Scripts that should always run locally on the controller, never be
 # forwarded to the controlled side. Registered by callers (typically the
@@ -664,7 +782,6 @@ _SYNTH_RING_SCRIPT_NAMES = (
 # the RemoteClient's ``localScripts`` set every time ``apply_local_scripts``
 # runs.
 _persistent_local_scripts: List[Any] = []
-
 
 def register_persistent_local_script(script: Any) -> None:
     """Add a bound script method to the always-local set.
@@ -755,6 +872,138 @@ def apply_local_scripts() -> None:
         for s in scripts:
             local_scripts.discard(s)
         log.info("rsc: synth-settings-ring scripts allowed to forward to remote")
+
+
+def _rebind_dispatch_handlers() -> None:
+    """Re-register our current wrappers on every weakref-backed
+    extension-point binding that captured a bound method against a
+    class attribute we class-patch.
+
+    Background: NVDA stores extension-point handlers via
+    ``BoundMethodWeakref``, which holds weak references to both the
+    instance and the underlying function. When we class-patch
+    ``LocalMachine.sendKey`` (et al.), the previously registered bound
+    method captures *our wrap function* as its ``__func__``. As soon as
+    our ``uninstall()`` puts the original back on the class, nothing
+    strong-references our old wrap any more — Python collects it, the
+    weakref dies, and on the next dispatch ``Action.notify`` /
+    ``Decider.decide`` silently skips the dead entry. Symptom: the
+    controlled machine stops accepting remote keystrokes (KEY inbound
+    weakref dead) and/or the leader stops forwarding keys (decide_
+    handleRawKey weakref dead) until the user reconnects.
+
+    Two classes of binding need attention:
+
+    1. ``RemoteSession.__init__`` and ``FollowerSession.__init__``
+       capture bound methods via ``transport.registerInbound(...)``:
+         * ``KEY``           ← ``localMachine.sendKey``         (follower)
+         * ``BRAILLE_INPUT`` ← ``localMachine.brailleInput``    (follower)
+         * ``CLIENT_JOINED`` ← ``session.handleClientConnected``(both sessions)
+         * ``CLIENT_LEFT``   ← ``session.handleClientDisconnected``(both)
+
+    2. ``RemoteClient.__init__`` captures a bound method via
+       ``inputCore.decide_handleRawKey.register(self.processKeyInput)``.
+       This is on the *leader* side and gates outbound key forwarding.
+
+    Class-attribute patches that are *not* captured this way — e.g.
+    ``TCPTransport.parse`` (resolved via ``self.parse`` at call time on
+    every line) and the ``RemoteClient.onConnectedAs*`` callbacks — are
+    unaffected because they're attribute-looked-up on each call, not
+    weak-bound at construction.
+
+    Safe to call any time: if no session / no client exists yet, the
+    early ``None`` checks make it a no-op. The freshly registered bound
+    method becomes a new strong-anchored entry alongside the dead one;
+    ``Action.notify`` / ``Decider.decide`` skip dead weakrefs and fire
+    the live one.
+    """
+    rc = _running_client()
+    if rc is None:
+        return
+    try:
+        protocol_mod = importlib.import_module("_remoteClient.protocol")
+    except ImportError:
+        log.warning("rsc: cannot import _remoteClient.protocol for handler rebind")
+        return
+    RemoteMessageType = getattr(protocol_mod, "RemoteMessageType", None)
+    if RemoteMessageType is None:
+        log.warning("rsc: RemoteMessageType missing; skipping handler rebind")
+        return
+
+    follower_bindings = (
+        ("KEY", "localMachine", "sendKey"),
+        ("BRAILLE_INPUT", "localMachine", "brailleInput"),
+        ("CLIENT_JOINED", None, "handleClientConnected"),
+        ("CLIENT_LEFT", None, "handleClientDisconnected"),
+    )
+    leader_bindings = (
+        ("CLIENT_JOINED", None, "handleClientConnected"),
+        ("CLIENT_LEFT", None, "handleClientDisconnected"),
+    )
+
+    for session_attr, bindings in (
+        ("followerSession", follower_bindings),
+        ("leaderSession", leader_bindings),
+    ):
+        session = getattr(rc, session_attr, None)
+        if session is None:
+            continue
+        transport = getattr(session, "transport", None)
+        if transport is None:
+            continue
+        inbound = getattr(transport, "inboundHandlers", None)
+        if inbound is None:
+            continue
+        rebound_count = 0
+        for msg_name, sub_attr, method_name in bindings:
+            msg_type = getattr(RemoteMessageType, msg_name, None)
+            if msg_type is None:
+                continue
+            action = inbound.get(msg_type)
+            if action is None:
+                # The session registered this handler at __init__, so
+                # the entry must exist if the session is alive. If it
+                # doesn't, skip silently rather than create one — we'd
+                # be guessing at the right Action type.
+                continue
+            target = session if sub_attr is None else getattr(session, sub_attr, None)
+            if target is None:
+                continue
+            handler = getattr(target, method_name, None)
+            if handler is None:
+                continue
+            try:
+                action.register(handler)
+                rebound_count += 1
+            except Exception:
+                log.exception(
+                    "rsc: rebind %s on %s failed", msg_name, session_attr,
+                )
+        if rebound_count:
+            log.info(
+                "rsc: rebound %d inbound handler(s) on %s after reload",
+                rebound_count, session_attr,
+            )
+
+    # Leader-side outbound-key gate. Patching RemoteClient.processKeyInput
+    # invalidates the weakref captured at RemoteClient.__init__:
+    #   inputCore.decide_handleRawKey.register(self.processKeyInput)
+    # Re-register the current bound method so leader-side key forwarding
+    # keeps working after a mid-session reload.
+    try:
+        import inputCore  # NVDA's input core, always present in NVDA process
+    except Exception:
+        log.exception("rsc: inputCore import failed; processKeyInput rebind skipped")
+        inputCore = None  # type: ignore[assignment]
+    if inputCore is not None:
+        decider = getattr(inputCore, "decide_handleRawKey", None)
+        handler = getattr(rc, "processKeyInput", None)
+        if decider is not None and handler is not None:
+            try:
+                decider.register(handler)
+                log.info("rsc: rebound RemoteClient.processKeyInput on inputCore.decide_handleRawKey after reload")
+            except Exception:
+                log.exception("rsc: rebind processKeyInput on decide_handleRawKey failed")
 
 
 def toggle_mute_action() -> str:

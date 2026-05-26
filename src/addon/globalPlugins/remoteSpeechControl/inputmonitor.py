@@ -106,10 +106,17 @@ def _hook_proc(nCode, wParam, lParam):
     # session. Direct attribute read without acquiring state._lock —
     # a Python boolean read is atomic and a stale read is bounded
     # harm (one keystroke too late at worst).
-    if nCode == HC_ACTION and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-        if state_module.state.muted_by_remote:
+    if (
+        nCode == HC_ACTION
+        and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        and state_module.state.muted_by_remote
+    ):
+        try:
+            kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT))[0]
+        except Exception:
+            kb = None
+        if kb is not None:
             try:
-                kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT))[0]
                 is_injected = bool(kb.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
                 if not is_injected:
                     # Physical key: confirmed local user activity,
