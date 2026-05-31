@@ -195,6 +195,27 @@ def uninstall() -> None:
             setattr(owner, attr, original)
         except Exception:
             log.exception("rsc: failed restoring %r.%s", owner, attr)
+
+    # Mid-session reload detection. If a RemoteClient session is still
+    # connected at our teardown time, this is almost certainly a plugin
+    # reload (NVDA hasn't disconnected the session yet, so it's not a
+    # full shutdown) rather than an addon disable. In that case we want
+    # to preserve the audio mute across the reload — install() and
+    # _rebind_dispatch_handlers() will repopulate our shadow state, and
+    # whatever mute the controller had armed stays armed. Otherwise
+    # (addon disabled, NVDA shutting down, no session ever connected)
+    # we release the mute as a safety measure so audio isn't left
+    # muted with nothing to clear it.
+    has_live_session = False
+    if rc is not None:
+        for t in (
+            getattr(rc, "leaderTransport", None),
+            getattr(rc, "followerTransport", None),
+        ):
+            if t is not None and getattr(t, "connected", False):
+                has_live_session = True
+                break
+
     _nonce_trackers.clear()
     _failure_limiters.clear()
     _transport_roles.clear()
@@ -203,7 +224,8 @@ def uninstall() -> None:
     _pending_consent_transports.clear()
     _input_frozen_transports.clear()
     _peer_muted_state.clear()
-    state_module.state.set_muted_by_remote(False)
+    if not has_live_session:
+        state_module.state.set_muted_by_remote(False)
 
 
 def _patch(owner: Any, attr: str, factory: Callable[[Any], Any]) -> None:
@@ -1004,6 +1026,44 @@ def _rebind_dispatch_handlers() -> None:
                 log.info("rsc: rebound RemoteClient.processKeyInput on inputCore.decide_handleRawKey after reload")
             except Exception:
                 log.exception("rsc: rebind processKeyInput on decide_handleRawKey failed")
+
+    # Repopulate our protocol shadow state for the live transports.
+    # uninstall() cleared _transport_roles, _nonce_trackers,
+    # _failure_limiters and _capability_processed; without restoring
+    # them, _on_mute_request / _on_unmute_request would hit the
+    # "untracked transport; ignoring" early-return on the next inbound
+    # request and the controlled side's user would see the controller's
+    # mute hotkey silently do nothing. Fresh NonceTracker and
+    # FailureLimiter are fine — the TCP connection is the same but our
+    # auth state can legitimately restart from zero across a reload.
+    # Marking the transport as already capability-processed prevents a
+    # redundant capability exchange (the live session has already
+    # agreed on protocol version).
+    #
+    # _peer_muted_state is deliberately NOT restored — we don't know
+    # the peer's current mute state after our reload wiped it. The
+    # first MSG_STATE we receive (in response to the next mute_request
+    # / unmute_request, or unsolicited if the peer sends one) will
+    # repopulate it correctly. _session_consented_transports is also
+    # not restored — re-prompting for consent on a fresh mute_request
+    # is the security-positive default.
+    for transport, role in (
+        (getattr(rc, "leaderTransport", None), "leader"),
+        (getattr(rc, "followerTransport", None), "follower"),
+    ):
+        if transport is None or not getattr(transport, "connected", False):
+            continue
+        tid = id(transport)
+        if tid in _transport_roles:
+            continue
+        _transport_roles[tid] = role
+        _nonce_trackers[tid] = protocol.NonceTracker()
+        _failure_limiters[tid] = protocol.FailureLimiter()
+        _capability_processed.add(tid)
+        log.info(
+            "rsc: restored protocol shadow state for %s transport after reload (id=%x)",
+            role, tid,
+        )
 
 
 def toggle_mute_action() -> str:

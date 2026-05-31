@@ -272,6 +272,36 @@ def install() -> None:
     global _listener_registered
     if _listener_registered:
         return
+    # Mid-session reload detection (third leg of the reload-survival fix).
+    # NVDA's plugin reload re-imports our submodules, including state.py,
+    # which means state.state is a brand new MuteState() with default
+    # ``False`` flags by the time we get here. If we just registered the
+    # listener and waited for traffic, the first inbound key from the
+    # remote would fire mark_remote_input() → first state transition
+    # since reload → listener fires → _do_set_mute(False) → audio
+    # unmuted, defeating the upstream uninstall-side fixes that
+    # preserved the WASAPI mute through the brief teardown.
+    #
+    # Instead: ask the OS what mute state the audio session is currently
+    # in. The session mute is owned by Windows and survives our module
+    # reload. If it's muted, that's because the previous incarnation
+    # armed it — restore both flags on the new state singleton to match,
+    # BEFORE registering the listener so the restoration itself doesn't
+    # round-trip back through SetMute.
+    volume = _acquire_volume()
+    if volume is not None:
+        try:
+            current_mute = volume.GetMute()
+        except Exception:
+            log.exception("rsc: failed to query OS-level mute state on install")
+            current_mute = False
+        if current_mute:
+            state_module.state.restore_for_reload(
+                muted_by_remote=True, remote_driving=True,
+            )
+            log.info(
+                "rsc: detected OS-level mute on install; restored state.muted_by_remote and state.remote_driving",
+            )
     state_module.state.add_listener(_on_state_changed)
     _listener_registered = True
     log.info("rsc: OS-level audio session mute armed")
@@ -285,13 +315,29 @@ def uninstall() -> None:
         except Exception:
             log.exception("rsc: remove_listener failed")
         _listener_registered = False
-    # Always unmute on shutdown. Leaving the audio session muted would
-    # be a nightmare for the user to discover later, since the addon's
-    # UI wouldn't be there to undo it.
-    try:
-        if _simple_audio_volume is not None:
-            _simple_audio_volume.SetMute(False, None)
-    except Exception:
-        log.exception("rsc: cleanup SetMute(False) failed")
+    # Two scenarios at this teardown point:
+    #
+    # 1. Mid-session reload (plugin reload during an active remote
+    #    session): ``remoteintegration.uninstall()`` already detected
+    #    the live RemoteClient and DID NOT clear ``state.muted_by_remote``.
+    #    So if that flag is True here, the controller has the mute armed
+    #    and we want to preserve the audio session mute across the
+    #    reload. Leaving the WASAPI mute alone is exactly what's needed
+    #    — install() will re-register our listener, the OS-level mute
+    #    persists in place, and when an unmute/mute request flows in
+    #    after the reload, the listener flips it correctly.
+    #
+    # 2. Addon disable / NVDA shutdown / never-had-a-session: the
+    #    ``muted_by_remote`` flag is False (either never set, or
+    #    actively cleared by remoteintegration.uninstall's "no live
+    #    session" branch). Force-unmute as a safety net — leaving the
+    #    audio session muted with no addon UI to clear it would be a
+    #    nightmare to discover later.
+    if not state_module.state.muted_by_remote:
+        try:
+            if _simple_audio_volume is not None:
+                _simple_audio_volume.SetMute(False, None)
+        except Exception:
+            log.exception("rsc: cleanup SetMute(False) failed")
     _simple_audio_volume = None
     log.info("rsc: OS-level audio session mute disarmed")

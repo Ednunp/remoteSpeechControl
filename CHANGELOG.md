@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0
+
+One fix, building on the reload work from 0.8.0.
+
+**Reloading the add-on no longer un-mutes the controlled machine, and the mute hotkey still works afterwards.** In 0.8.0, reloading plugins while a remote session was active released the audio mute as part of the teardown, and the controller's mute hotkey then had no effect (the controlled side silently rejected the request). Now the mute is preserved across the reload and the hotkey continues to work normally. (Thanks Andre for reporting this on GitHub.) Fixed.
+
 ## 0.8.0
 
 Two fixes.

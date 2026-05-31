@@ -90,5 +90,22 @@ class MuteState:
         with self._lock:
             return self.muted_by_remote and self.remote_driving
 
+    def restore_for_reload(self, muted_by_remote: bool, remote_driving: bool) -> None:
+        """Set both flags directly without firing listeners.
+
+        Used by ``audiomute.install()`` after a mid-session plugin reload
+        when the OS-level audio session mute indicates the previous
+        incarnation had armed muting. Bypasses ``_notify`` because the
+        listener hasn't been registered yet at this point — and even if
+        it had, we wouldn't want it to react: the OS audio mute is
+        already in the desired state, the state singleton is the one
+        that's stale, and the whole point is to bring the singleton
+        back into agreement with reality without round-tripping through
+        ``SetMute`` again.
+        """
+        with self._lock:
+            self.muted_by_remote = muted_by_remote
+            self.remote_driving = remote_driving
+
 
 state = MuteState()
