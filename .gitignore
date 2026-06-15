@@ -5,6 +5,8 @@ dist/
 *.tmp
 *.tmp.*
 .gh-token.txt
+# Internal dev handover — local notes, not for the public repo.
+HANDOVER.md
 *.log
 .DS_Store
 Thumbs.db
