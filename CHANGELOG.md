@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0
+
+**New: announce your own machine's battery status when querying battery from a remote.** If you're on a laptop controlling a desktop and you press NVDA+Shift+B (NVDA's "report battery status" hotkey), the desktop normally answers "No system battery" — which isn't what you want to hear. This add-on now has an option to make your own machine answer instead, or both machines one after the other.
+
+Turn it on in the Remote Speech Control settings panel. Two new options:
+
+- "Announce local machine battery status when querying battery from a remote session" (off by default).
+- "Battery announcement order" — three choices: local then remote, remote then local, local only.
+
+The wording is exactly what NVDA would normally say, just prefixed with "Local" or "Remote" so you can tell them apart. If the remote doesn't reply within two seconds (e.g. it's running an older version of the add-on or the network is being slow), the local answer is given anyway so you're never left without an announcement.
+
 ## 1.0.0
 
 One fix, building on the reload work from 0.8.0.

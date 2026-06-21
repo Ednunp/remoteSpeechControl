@@ -32,6 +32,15 @@ MSG_MUTE_REQUEST = "remoteSpeechControl_mute_request"
 MSG_UNMUTE_REQUEST = "remoteSpeechControl_unmute_request"
 MSG_STATE = "remoteSpeechControl_state"
 MSG_CONSENT_PENDING = "remoteSpeechControl_consent_pending"
+# Battery announcement messages. Unlike the mute messages these are NOT
+# authenticated — battery percentage is non-sensitive and anyone who has
+# network access to your NVDA Remote channel already has bigger access
+# than your battery level. Sender: controller. Recipient: controlled side
+# captures NVDA's exact battery-status announcement text and sends it
+# back verbatim so the controller speaks identical wording to NVDA's
+# normal report-battery script.
+MSG_BATTERY_REQUEST = "remoteSpeechControl_battery_request"
+MSG_BATTERY_RESPONSE = "remoteSpeechControl_battery_response"
 
 ACTION_MUTE = "mute"
 ACTION_UNMUTE = "unmute"

@@ -42,6 +42,28 @@ class RemoteSpeechControlPanel(SettingsPanel):
         )
         self._keep_ring_ctrl.SetValue(config_spec.get_keep_synth_settings_ring_local())
 
+        self._battery_local_ctrl = helper.addItem(
+            wx.CheckBox(
+                self,
+                label="Announce local machine &battery status when querying battery from a remote session",
+            )
+        )
+        self._battery_local_ctrl.SetValue(config_spec.get_announce_local_battery_on_remote())
+        self._battery_local_ctrl.Bind(wx.EVT_CHECKBOX, self._on_battery_local_toggle)
+
+        self._battery_mode_ctrl = helper.addLabeledControl(
+            "Battery announcement &order:",
+            wx.Choice,
+            choices=list(config_spec.BATTERY_MODE_LABELS),
+        )
+        current_mode = config_spec.get_battery_announcement_mode()
+        try:
+            current_idx = config_spec.BATTERY_MODE_ORDER.index(current_mode)
+        except ValueError:
+            current_idx = 0
+        self._battery_mode_ctrl.SetSelection(current_idx)
+        self._battery_mode_ctrl.Enable(self._battery_local_ctrl.GetValue())
+
         self._verbose_ctrl = helper.addItem(
             wx.CheckBox(self, label="&Verbose logging")
         )
@@ -58,21 +80,33 @@ class RemoteSpeechControlPanel(SettingsPanel):
             )
         )
 
+    def _on_battery_local_toggle(self, event: wx.CommandEvent) -> None:
+        # Enable / disable the order ComboBox in step with the checkbox.
+        # Disabled state still navigable; NVDA announces "disabled" which
+        # is the right cue that the choice has no effect right now.
+        self._battery_mode_ctrl.Enable(self._battery_local_ctrl.GetValue())
+
     def onSave(self) -> None:
         section = config.conf[config_spec.SECTION]
         section["password"] = self._password_ctrl.GetValue()
         section["autoRequestOnConnect"] = self._auto_ctrl.GetValue()
         section["allowAutoMute"] = self._allow_ctrl.GetValue()
         section["keepSynthSettingsRingLocal"] = self._keep_ring_ctrl.GetValue()
+        section["announceLocalBatteryOnRemote"] = self._battery_local_ctrl.GetValue()
+        sel = self._battery_mode_ctrl.GetSelection()
+        if 0 <= sel < len(config_spec.BATTERY_MODE_ORDER):
+            section["batteryAnnouncementMode"] = config_spec.BATTERY_MODE_ORDER[sel]
         section["verboseLogging"] = self._verbose_ctrl.GetValue()
         logger.configure_verbosity(section["verboseLogging"])
         log.info(
             "rsc: settings saved (password set: %s, auto-request: %s, allow-auto-mute: %s, "
-            "keep-ring-local: %s, verbose: %s)",
+            "keep-ring-local: %s, battery-local: %s, battery-mode: %s, verbose: %s)",
             bool(section["password"]),
             section["autoRequestOnConnect"],
             section["allowAutoMute"],
             section["keepSynthSettingsRingLocal"],
+            section["announceLocalBatteryOnRemote"],
+            section["batteryAnnouncementMode"],
             section["verboseLogging"],
         )
         try:

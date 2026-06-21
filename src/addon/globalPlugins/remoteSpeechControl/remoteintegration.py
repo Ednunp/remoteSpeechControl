@@ -83,6 +83,23 @@ _peer_muted_state: Dict[int, bool] = {}
 # of driving the machine until the local user resolves the mute prompt.
 _input_frozen_transports: set = set()
 
+# Transport ids on the leader side where we've sent a battery_request
+# and are waiting for the corresponding battery_response. Used to drive
+# the timeout fallback.
+_battery_request_pending: set = set()
+# Transport ids on the leader side where the user selected the
+# "remote then local" announcement order. When the battery_response
+# arrives, the local battery is spoken after the remote one. The same
+# tids drive the timeout fallback: if the remote never responds, the
+# local battery is still spoken so the user isn't left silent.
+_pending_post_remote_local_battery: set = set()
+
+# How long to wait for the remote battery_response before falling back
+# to the local-only announcement. Two seconds is well above typical
+# LAN / Internet round-trips and short enough that the user doesn't
+# perceive a stall.
+BATTERY_REPLY_TIMEOUT_MS = 2000
+
 
 def install() -> None:
     global _remote_pkg
@@ -224,6 +241,8 @@ def uninstall() -> None:
     _pending_consent_transports.clear()
     _input_frozen_transports.clear()
     _peer_muted_state.clear()
+    _battery_request_pending.clear()
+    _pending_post_remote_local_battery.clear()
     if not has_live_session:
         state_module.state.set_muted_by_remote(False)
 
@@ -527,10 +546,44 @@ _SYNTH_RING_SCRIPT_NAMES = (
 )
 _SYNTH_RING_PREEMPT_NAMES = frozenset(_SYNTH_RING_SCRIPT_NAMES)
 
+# vk code for ``B`` — NVDA's default report-battery-status chord is
+# ``NVDA+shift+b``. Used as a cheap pre-filter so the gesture lookup
+# only runs on candidate keys rather than every keystroke.
+_BATTERY_CANDIDATE_VK = 0x42
+
 
 def _make_patched_process_key_input(original: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(original)
     def wrapper(self, vkCode=None, scanCode=None, extended=None, pressed=None):
+        # Battery announcement orchestration. Only meaningful when the
+        # user has the feature on, the chord is a candidate, and they're
+        # F11'd in. If those all hold AND the resolved gesture is the
+        # battery script AND it's in localScripts (added by
+        # apply_local_scripts when the feature is enabled), we bypass
+        # the original processKeyInput entirely — the orchestration
+        # decides what to speak based on the chosen announcement order.
+        if (
+            pressed
+            and vkCode == _BATTERY_CANDIDATE_VK
+            and getattr(self, "sendingKeys", False)
+            and config_spec.get_announce_local_battery_on_remote()
+        ):
+            try:
+                from keyboardHandler import KeyboardInputGesture
+                gp = KeyboardInputGesture(
+                    self.keyModifiers, vkCode, scanCode, extended,
+                )
+                if not gp.isModifier:
+                    script_p = gp.script
+                    if (
+                        _is_battery_script(script_p)
+                        and script_p in self.localScripts
+                    ):
+                        _orchestrate_battery_announcement(self)
+                        return False  # block default forwarding
+            except Exception:
+                log.exception("rsc: battery orchestration failed")
+
         # Bail out fast for the overwhelming majority of keystrokes
         # that can't possibly be a synth-ring chord: not pressed, not
         # in remote-control mode, or not one of the candidate vk codes.
@@ -582,6 +635,10 @@ def _dispatch_custom(transport: Any, msg_type: str, payload: Dict[str, Any]) -> 
             _on_state(transport, **payload)
         elif msg_type == protocol.MSG_CONSENT_PENDING:
             _on_consent_pending(transport, **payload)
+        elif msg_type == protocol.MSG_BATTERY_REQUEST:
+            _on_battery_request(transport, **payload)
+        elif msg_type == protocol.MSG_BATTERY_RESPONSE:
+            _on_battery_response(transport, **payload)
         else:
             log.debug("rsc: unknown custom type %s", msg_type)
     except Exception:
@@ -793,6 +850,184 @@ def _announce(text: str) -> None:
         log.warning("rsc: ui.message failed", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Battery announcement
+# ---------------------------------------------------------------------------
+#
+# NVDA's NVDA+shift+B chord is bound to ``globalCommands.script_say_battery_status``
+# which delegates to ``winAPI._powerTracking.reportCurrentBatteryStatus``.
+# That function builds a localized announcement string from
+# ``GetSystemPowerStatus()`` and speaks it via ``ui.message``.
+#
+# To mirror NVDA's wording exactly (correct locale, correct pluralisation,
+# correct "Plugged in"/"Unplugged"/"X hours and Y minutes remaining"
+# phrasing) we don't reimplement the formatting — we invoke NVDA's own
+# function with ``ui.message`` temporarily monkey-patched to a capture
+# callable instead of running it. The capture is scoped to a single
+# synchronous call and restored immediately afterwards, so no other speech
+# is intercepted.
+
+def _capture_battery_text() -> str:
+    """Call NVDA's own report-battery-status logic and capture exactly
+    what it would have spoken, without speaking it.
+
+    Returns the captured string, or empty string on any failure (which
+    causes the caller to skip the announcement rather than speak something
+    misleading).
+    """
+    try:
+        import ui as ui_module
+        from winAPI._powerTracking import reportCurrentBatteryStatus
+    except Exception:
+        log.exception("rsc: battery query — import failed")
+        return ""
+
+    captured: List[str] = []
+
+    def _capture(text: str, *args: Any, **kwargs: Any) -> None:
+        captured.append(text)
+
+    original_message = ui_module.message
+    ui_module.message = _capture
+    try:
+        reportCurrentBatteryStatus()
+    except Exception:
+        log.exception("rsc: battery query — reportCurrentBatteryStatus raised")
+    finally:
+        ui_module.message = original_message
+
+    return captured[0] if captured else ""
+
+
+def _get_battery_script() -> Optional[Any]:
+    """Return NVDA's battery-status script as a bound method on
+    ``globalCommands.commands``, or None if it can't be located."""
+    try:
+        import globalCommands
+    except Exception:
+        log.exception("rsc: globalCommands import failed")
+        return None
+    commands = getattr(globalCommands, "commands", None)
+    if commands is None:
+        return None
+    return getattr(commands, "script_say_battery_status", None)
+
+
+def _is_battery_script(script: Any) -> bool:
+    if script is None:
+        return False
+    return getattr(script, "__name__", "") == "script_say_battery_status"
+
+
+def _speak_local_battery() -> None:
+    text = _capture_battery_text()
+    if text:
+        _announce("Local " + text)
+
+
+def _speak_remote_battery(text: str) -> None:
+    if text:
+        _announce("Remote " + text)
+
+
+def _send_battery_request(transport: Any) -> None:
+    _send_custom(transport, protocol.MSG_BATTERY_REQUEST)
+
+
+def _send_battery_response(transport: Any, text: str) -> None:
+    _send_custom(transport, protocol.MSG_BATTERY_RESPONSE, text=text)
+
+
+def _on_battery_request(transport: Any, **_: Any) -> None:
+    """Controlled side: respond with NVDA's exact battery announcement text.
+
+    We deliberately don't gate this on auth — battery status is non-sensitive
+    and anyone with channel access already has stronger access. We also
+    don't gate on the controlled-side setting: if the controller asked,
+    answer. The controller decides what to do with it.
+    """
+    if _is_leader_for(transport) is True:
+        # The leader sent a request to itself somehow — ignore.
+        return
+    text = _capture_battery_text()
+    _send_battery_response(transport, text)
+
+
+def _on_battery_response(transport: Any, text: str = "", **_: Any) -> None:
+    """Controller side: announce the remote's text, optionally followed by
+    the local battery if the user chose ``remote_then_local`` ordering."""
+    if _is_leader_for(transport) is not True:
+        return
+    tid = id(transport)
+    _battery_request_pending.discard(tid)
+    _speak_remote_battery(text)
+    if tid in _pending_post_remote_local_battery:
+        _pending_post_remote_local_battery.discard(tid)
+        wx.CallAfter(_speak_local_battery)
+
+
+def _on_battery_timeout(tid: int) -> None:
+    """Wired via ``wx.CallLater`` from ``_orchestrate_battery_announcement``.
+
+    Fires unconditionally after ``BATTERY_REPLY_TIMEOUT_MS``; the
+    ``_battery_request_pending`` membership check is how we tell whether
+    the response already arrived (in which case this is a no-op) or the
+    remote went silent. In the silent case, fall back: if the user was
+    expecting a follow-up local announcement (``remote_then_local`` mode),
+    speak it now so they aren't left without any answer at all.
+    """
+    if tid not in _battery_request_pending:
+        return  # response arrived in time
+    _battery_request_pending.discard(tid)
+    log.warning("rsc: remote battery request timed out (tid=%x)", tid)
+    if tid in _pending_post_remote_local_battery:
+        _pending_post_remote_local_battery.discard(tid)
+        wx.CallAfter(_speak_local_battery)
+
+
+def _orchestrate_battery_announcement(rc: Any) -> None:
+    """Decide what to do when the user presses the battery chord while
+    F11'd in. Invoked from the processKeyInput wrap."""
+    leader = getattr(rc, "leaderTransport", None)
+    if leader is None or not getattr(leader, "connected", False):
+        # No live remote transport — just speak the local battery as a
+        # graceful fallback.
+        wx.CallAfter(_speak_local_battery)
+        return
+
+    mode = config_spec.get_battery_announcement_mode()
+    tid = id(leader)
+
+    if mode == "local_only":
+        wx.CallAfter(_speak_local_battery)
+        return
+
+    if mode == "local_then_remote":
+        wx.CallAfter(_speak_local_battery)
+        _battery_request_pending.add(tid)
+        _send_battery_request(leader)
+        try:
+            wx.CallLater(BATTERY_REPLY_TIMEOUT_MS, _on_battery_timeout, tid)
+        except Exception:
+            log.exception("rsc: scheduling battery timeout failed")
+        return
+
+    if mode == "remote_then_local":
+        _pending_post_remote_local_battery.add(tid)
+        _battery_request_pending.add(tid)
+        _send_battery_request(leader)
+        try:
+            wx.CallLater(BATTERY_REPLY_TIMEOUT_MS, _on_battery_timeout, tid)
+        except Exception:
+            log.exception("rsc: scheduling battery timeout failed")
+        return
+
+    # Unknown / invalid mode value — default to local-only as the safe
+    # behaviour (always produces some audible output).
+    log.warning("rsc: unknown battery announcement mode %r; defaulting to local-only", mode)
+    wx.CallAfter(_speak_local_battery)
+
+
 # _SYNTH_RING_SCRIPT_NAMES is defined near the top of the file
 # (next to the processKeyInput wrap) because that wrap consumes it
 # for synth-ring speech preemption. ``_get_synth_ring_scripts`` /
@@ -865,6 +1100,14 @@ def apply_local_scripts() -> None:
        "Synth settings ring adjusts this machine, not the remote" setting
        ticked.
 
+    3. NVDA's report-battery-status script — added only if the user has
+       the "Announce local machine battery status when querying battery
+       from a remote session" setting ticked. The actual orchestration
+       (deciding whether to also fetch and announce the remote's battery)
+       is in the processKeyInput wrap; this just makes sure the chord
+       doesn't get forwarded to the remote when the user has the feature
+       enabled.
+
     NVDA Remote's ``processKeyInput`` already runs ``localScripts`` entries
     on the local machine and skips forwarding them, so reconciling this
     set is all we need to do.
@@ -883,17 +1126,25 @@ def apply_local_scripts() -> None:
     if _persistent_local_scripts:
         log.info("rsc: %d persistent local script(s) registered", len(_persistent_local_scripts))
     # Conditional: synth settings ring.
-    scripts = _get_synth_ring_scripts()
-    if not scripts:
-        return
-    if config_spec.get_keep_synth_settings_ring_local():
-        for s in scripts:
-            local_scripts.add(s)
-        log.info("rsc: %d synth-settings-ring scripts kept local", len(scripts))
-    else:
-        for s in scripts:
-            local_scripts.discard(s)
-        log.info("rsc: synth-settings-ring scripts allowed to forward to remote")
+    synth_ring = _get_synth_ring_scripts()
+    if synth_ring:
+        if config_spec.get_keep_synth_settings_ring_local():
+            for s in synth_ring:
+                local_scripts.add(s)
+            log.info("rsc: %d synth-settings-ring scripts kept local", len(synth_ring))
+        else:
+            for s in synth_ring:
+                local_scripts.discard(s)
+            log.info("rsc: synth-settings-ring scripts allowed to forward to remote")
+    # Conditional: NVDA's report-battery-status script.
+    battery_script = _get_battery_script()
+    if battery_script is not None:
+        if config_spec.get_announce_local_battery_on_remote():
+            local_scripts.add(battery_script)
+            log.info("rsc: battery-status script kept local for custom announcement")
+        else:
+            local_scripts.discard(battery_script)
+            log.info("rsc: battery-status script allowed to forward to remote")
 
 
 def _rebind_dispatch_handlers() -> None:
