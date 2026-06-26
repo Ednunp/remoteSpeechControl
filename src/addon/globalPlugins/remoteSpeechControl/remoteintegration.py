@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import wx
@@ -73,6 +74,12 @@ _transport_roles: Dict[int, str] = {}
 _capability_processed: set = set()
 _session_consented_transports: set = set()
 _pending_consent_transports: set = set()
+# True while the controller-side "Mute speech on the remote machine?"
+# dialog is on screen. Set by ``_prompt_to_mute`` before it goes modal
+# and cleared in its finally block. Prevents multiple confirmation
+# dialogs stacking when peers reconnect in quick succession — see
+# GitHub issue #2.
+_mute_prompt_open: bool = False
 # Controller-side mirror of the controlled peer's audible-mute state,
 # tracked from inbound MSG_STATE so the toggle-mute hotkey on the
 # controller knows whether to open the "Mute?" or the "Unmute?"
@@ -87,12 +94,12 @@ _input_frozen_transports: set = set()
 # and are waiting for the corresponding battery_response. Used to drive
 # the timeout fallback.
 _battery_request_pending: set = set()
-# Transport ids on the leader side where the user selected the
-# "remote then local" announcement order. When the battery_response
-# arrives, the local battery is spoken after the remote one. The same
-# tids drive the timeout fallback: if the remote never responds, the
-# local battery is still spoken so the user isn't left silent.
-_pending_post_remote_local_battery: set = set()
+# Map from transport id to the announcement mode the user had selected
+# at the time of the chord press. Read back when the battery_response
+# arrives (or when the timeout fires) so a settings change mid-flight
+# doesn't shift the ordering. Cleared as soon as the announcement is
+# spoken.
+_battery_announce_modes: Dict[int, str] = {}
 
 # How long to wait for the remote battery_response before falling back
 # to the local-only announcement. Two seconds is well above typical
@@ -242,7 +249,9 @@ def uninstall() -> None:
     _input_frozen_transports.clear()
     _peer_muted_state.clear()
     _battery_request_pending.clear()
-    _pending_post_remote_local_battery.clear()
+    _battery_announce_modes.clear()
+    global _mute_prompt_open
+    _mute_prompt_open = False
     if not has_live_session:
         state_module.state.set_muted_by_remote(False)
 
@@ -679,6 +688,23 @@ def _on_capability(transport: Any, version: Any = None, **_: Any) -> None:
 
 
 def _prompt_to_mute(transport: Any) -> None:
+    """Show the controller-side "Mute speech on the remote machine?" dialog.
+
+    Guarded by ``_mute_prompt_open`` so multiple reconnects can't stack
+    several dialogs on the user. When peers reconnect, ``_on_capability``
+    fires per new transport id (correct dedup target most of the time)
+    and schedules a fresh ``_prompt_to_mute`` via ``wx.CallAfter``. If
+    the user hasn't answered the first one yet, that flag short-circuits
+    the new attempts so only one dialog is ever modal at a time. The
+    skipped attempt's transport reference is also dropped, so a stale
+    transport whose dialog never gets shown can't keep itself alive.
+
+    See GitHub issue #2.
+    """
+    global _mute_prompt_open
+    if _mute_prompt_open:
+        log.info("rsc: mute prompt already open; ignoring duplicate schedule")
+        return
     if not getattr(transport, "connected", False):
         return
     try:
@@ -692,10 +718,15 @@ def _prompt_to_mute(transport: Any) -> None:
         "Remote Speech Control",
         style=wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
     )
+    _mute_prompt_open = True
     try:
         choice = dlg.ShowModal()
     finally:
-        dlg.Destroy()
+        try:
+            dlg.Destroy()
+        except Exception:
+            log.exception("rsc: mute prompt destroy failed")
+        _mute_prompt_open = False
     if choice == wx.ID_YES:
         _send_mute_request(transport)
 
@@ -919,17 +950,6 @@ def _is_battery_script(script: Any) -> bool:
     return getattr(script, "__name__", "") == "script_say_battery_status"
 
 
-def _speak_local_battery() -> None:
-    text = _capture_battery_text()
-    if text:
-        _announce("Local " + text)
-
-
-def _speak_remote_battery(text: str) -> None:
-    if text:
-        _announce("Remote " + text)
-
-
 def _send_battery_request(transport: Any) -> None:
     _send_custom(transport, protocol.MSG_BATTERY_REQUEST)
 
@@ -954,78 +974,158 @@ def _on_battery_request(transport: Any, **_: Any) -> None:
 
 
 def _on_battery_response(transport: Any, text: str = "", **_: Any) -> None:
-    """Controller side: announce the remote's text, optionally followed by
-    the local battery if the user chose ``remote_then_local`` ordering."""
+    """Controller side: combine the remote's text with the local battery
+    text into a single ``ui.message`` call in the user-chosen order, then
+    speak it.
+
+    Why one combined call instead of two: NVDA's speech subsystem
+    interrupts a currently-playing ``ui.message`` when a second one
+    arrives within ~100ms. With the remote round-trip on a LAN being
+    ~30-110ms, a separate local-then-remote pair gets clipped to
+    something like "Lo" + "Remote No system battery". One combined
+    string speaks atomically.
+
+    Trade-off: in ``local_then_remote`` mode the user waits one network
+    round-trip before hearing anything, rather than getting local
+    immediately. At the round-trip times we observe (under 110ms on
+    LAN) that wait is imperceptible.
+    """
     if _is_leader_for(transport) is not True:
+        log.warning("rsc: battery_response received but I'm not the leader; ignoring")
         return
     tid = id(transport)
+    mode = _battery_announce_modes.pop(tid, "local_then_remote")
     _battery_request_pending.discard(tid)
-    _speak_remote_battery(text)
-    if tid in _pending_post_remote_local_battery:
-        _pending_post_remote_local_battery.discard(tid)
-        wx.CallAfter(_speak_local_battery)
+    local_text = _capture_battery_text()
+    combined = _combine_battery_announcements(remote=text, local=local_text, mode=mode)
+    if combined:
+        _cancel_speech_safely()
+        wx.CallAfter(_announce, combined)
+    else:
+        log.warning("rsc: battery_response produced empty combined string; nothing to speak")
 
 
 def _on_battery_timeout(tid: int) -> None:
-    """Wired via ``wx.CallLater`` from ``_orchestrate_battery_announcement``.
+    """Wired via ``_schedule_battery_timeout`` from
+    ``_orchestrate_battery_announcement``.
 
     Fires unconditionally after ``BATTERY_REPLY_TIMEOUT_MS``; the
     ``_battery_request_pending`` membership check is how we tell whether
     the response already arrived (in which case this is a no-op) or the
-    remote went silent. In the silent case, fall back: if the user was
-    expecting a follow-up local announcement (``remote_then_local`` mode),
-    speak it now so they aren't left without any answer at all.
+    remote went silent. In the silent case, speak the local battery as
+    a fallback so the user is never left without any answer at all.
     """
     if tid not in _battery_request_pending:
         return  # response arrived in time
     _battery_request_pending.discard(tid)
-    log.warning("rsc: remote battery request timed out (tid=%x)", tid)
-    if tid in _pending_post_remote_local_battery:
-        _pending_post_remote_local_battery.discard(tid)
-        wx.CallAfter(_speak_local_battery)
+    _battery_announce_modes.pop(tid, None)
+    log.warning("rsc: battery_request timed out waiting for remote; speaking local only")
+    local_text = _capture_battery_text()
+    if local_text:
+        _cancel_speech_safely()
+        wx.CallAfter(_announce, "Local " + local_text)
+
+
+def _combine_battery_announcements(remote: str, local: str, mode: str) -> str:
+    """Build the single string we'll pass to ``ui.message``. Pieces are
+    prefixed with their machine label and joined with ". " so NVDA's
+    speech engine inserts a natural pause between them."""
+    parts: List[str] = []
+    if mode == "remote_then_local":
+        if remote:
+            parts.append("Remote " + remote)
+        if local:
+            parts.append("Local " + local)
+    else:  # local_then_remote and any unknown fallback
+        if local:
+            parts.append("Local " + local)
+        if remote:
+            parts.append("Remote " + remote)
+    return ". ".join(parts)
+
+
+def _schedule_battery_timeout(tid: int) -> None:
+    """Thread-safe alternative to ``wx.CallLater`` for our battery-reply
+    timeout. ``wx.CallLater`` asserts on non-main threads (it constructs a
+    ``wx.Timer`` internally and Windows enforces a main-thread-only
+    invariant on timers). Our caller is the LL-hook input thread, so we
+    use ``threading.Timer`` which is thread-safe, and bounce back to wx
+    via ``wx.CallAfter`` when it fires so ``_on_battery_timeout`` runs on
+    the main thread alongside all the other speech-touching code.
+    """
+    def _fire() -> None:
+        try:
+            wx.CallAfter(_on_battery_timeout, tid)
+        except Exception:
+            log.exception("rsc: battery timeout dispatch failed")
+    try:
+        timer = threading.Timer(BATTERY_REPLY_TIMEOUT_MS / 1000.0, _fire)
+        timer.daemon = True
+        timer.start()
+    except Exception:
+        log.exception("rsc: failed to schedule battery timeout")
+
+
+def _cancel_speech_safely() -> None:
+    """``speech.cancelSpeech()`` from any thread, via ``wx.CallAfter`` so
+    it lands on the wx main thread alongside the rest of NVDA's speech
+    manipulation. Called as the FIRST step before each chord-press's
+    first announcement so that any in-flight forwarded SPEAK from the
+    controlled side doesn't queue our announcement behind it (which is
+    how the announcement could otherwise be delayed or — under enough
+    queue pressure — feel like it's been silently dropped).
+    """
+    try:
+        import speech as _speech_mod
+        wx.CallAfter(_speech_mod.cancelSpeech)
+    except Exception:
+        log.exception("rsc: pre-announcement speech cancel failed")
 
 
 def _orchestrate_battery_announcement(rc: Any) -> None:
     """Decide what to do when the user presses the battery chord while
-    F11'd in. Invoked from the processKeyInput wrap."""
+    F11'd in. Invoked from the processKeyInput wrap on the LL-hook input
+    thread — everything that touches speech MUST be dispatched via
+    ``wx.CallAfter`` so it lands on the main thread.
+
+    For ``local_only`` mode we speak immediately. For the two combined
+    modes we send the request and wait for the response (or the timeout)
+    before speaking anything — see ``_on_battery_response`` for why the
+    two messages can't be spoken separately."""
     leader = getattr(rc, "leaderTransport", None)
     if leader is None or not getattr(leader, "connected", False):
         # No live remote transport — just speak the local battery as a
         # graceful fallback.
-        wx.CallAfter(_speak_local_battery)
+        wx.CallAfter(_speak_local_only)
         return
 
     mode = config_spec.get_battery_announcement_mode()
     tid = id(leader)
 
     if mode == "local_only":
-        wx.CallAfter(_speak_local_battery)
+        wx.CallAfter(_speak_local_only)
         return
 
-    if mode == "local_then_remote":
-        wx.CallAfter(_speak_local_battery)
+    if mode in ("local_then_remote", "remote_then_local"):
         _battery_request_pending.add(tid)
+        _battery_announce_modes[tid] = mode
         _send_battery_request(leader)
-        try:
-            wx.CallLater(BATTERY_REPLY_TIMEOUT_MS, _on_battery_timeout, tid)
-        except Exception:
-            log.exception("rsc: scheduling battery timeout failed")
-        return
-
-    if mode == "remote_then_local":
-        _pending_post_remote_local_battery.add(tid)
-        _battery_request_pending.add(tid)
-        _send_battery_request(leader)
-        try:
-            wx.CallLater(BATTERY_REPLY_TIMEOUT_MS, _on_battery_timeout, tid)
-        except Exception:
-            log.exception("rsc: scheduling battery timeout failed")
+        _schedule_battery_timeout(tid)
         return
 
     # Unknown / invalid mode value — default to local-only as the safe
     # behaviour (always produces some audible output).
     log.warning("rsc: unknown battery announcement mode %r; defaulting to local-only", mode)
-    wx.CallAfter(_speak_local_battery)
+    wx.CallAfter(_speak_local_only)
+
+
+def _speak_local_only() -> None:
+    """``local_only`` mode and "no live transport" fallback: cancel any
+    in-flight speech and speak just the local battery."""
+    text = _capture_battery_text()
+    if text:
+        _cancel_speech_safely()
+        wx.CallAfter(_announce, "Local " + text)
 
 
 # _SYNTH_RING_SCRIPT_NAMES is defined near the top of the file

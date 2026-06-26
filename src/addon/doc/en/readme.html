@@ -7,11 +7,12 @@
 <body>
 <h1>Remote Speech Control</h1>
 
-<p>Two related features for NVDA Remote sessions:</p>
+<p>Three related features for NVDA Remote sessions:</p>
 
 <ol>
 <li><strong>Speech muting on the controlled machine.</strong> Silences NVDA on the machine that is being controlled, while you are typing into it from the other machine. The moment any key is pressed on the controlled machine itself, speech comes back; it goes silent again the next time you type from the controlling machine. Muting only happens when both ends have the same password set, and the person at the controlled machine has to say yes the first time — unless they have already ticked a box to skip that prompt.</li>
 <li><strong>Local synth settings ring.</strong> Lets you cycle NVDA's voice, rate, pitch and volume settings on your local NVDA while you are remotely controlling another machine, instead of those keys going to the remote.</li>
+<li><strong>Local battery status when controlling another machine.</strong> Optionally answers NVDA's report-battery hotkey with your own machine's battery instead of the remote's. Particularly useful when you are on a laptop controlling a desktop, where the desktop has no battery to report.</li>
 </ol>
 
 <h2>Why this exists</h2>
@@ -45,6 +46,12 @@
 
 <h3>Synth settings ring adjusts this machine, not the remote (Alt+S)</h3>
 <p>Controller-side setting. When ticked, the synth settings ring keys (move between settings, increase, decrease) adjust the voice, rate, pitch, volume etc. of <em>your</em> NVDA while you are remotely controlling another machine, instead of being sent across to the remote. Default unticked.</p>
+
+<h3>Announce local machine battery status when querying battery from a remote session (Alt+B)</h3>
+<p>Controller-side setting. When ticked, pressing NVDA's report-battery hotkey (NVDA+Shift+B by default) while remotely controlling another machine reports your own machine's battery instead of forwarding the keystroke to the remote. Default unticked. See the "Battery status" section below for what changes once this is on.</p>
+
+<h3>Battery announcement order (Alt+O)</h3>
+<p>Controller-side setting. Picks whether you hear the local machine's battery first, the remote machine's battery first, or only the local one. Greyed out until the checkbox above is ticked. Default: local battery, then remote.</p>
 
 <h3>Verbose logging (Alt+V)</h3>
 <p>When ticked, the add-on writes a running commentary of what it's doing into NVDA's main log: when sessions start, when mute requests come and go, when speech is muted or unmuted. When unticked, it only writes when something actually goes wrong. Either way, real problems are always recorded; the setting just controls how chatty the log is. Default ticked, because looking in the log is the main way to work out what went wrong if anything misbehaves.</p>
@@ -87,6 +94,24 @@
 <p>NVDA's synth settings ring (the keys for moving between voice settings and turning them up or down — exactly which keys depends on which layout you have NVDA configured for) lets you cycle through synthesiser settings like voice, rate, pitch and volume, and adjust them. Without this add-on, those keys go across to the remote machine while you are remotely controlling it — useless, because you are listening to your own NVDA, not the remote's.</p>
 
 <p>Tick "Synth settings ring adjusts this machine, not the remote" on the controller side and those specific keys stay local. All other keys still go to the remote normally.</p>
+
+<h2>Battery status</h2>
+
+<p>If you are on a laptop controlling a remote desktop and you press NVDA's report-battery hotkey (NVDA+Shift+B on the default English layout), the chord normally goes across to the remote machine. The desktop has no battery, so it just answers "no system battery" — which is not what you wanted to hear.</p>
+
+<p>Tick "Announce local machine battery status when querying battery from a remote session" on the controller side and that chord is intercepted on your machine instead. Depending on the order you pick:</p>
+
+<ul>
+<li><strong>Local battery, then remote.</strong> You hear your own machine's battery first, then the remote's, both in one continuous announcement. The remote round-trip adds about a tenth of a second before either side speaks.</li>
+<li><strong>Remote battery, then local.</strong> Same as above, but the remote machine's battery comes first.</li>
+<li><strong>Local battery only.</strong> Just your own machine. The remote is not asked at all. The fastest of the three.</li>
+</ul>
+
+<p>The wording is exactly what NVDA would normally say — your laptop will read out percent, time remaining, plugged-in / unplugged just like it does outside a remote session — but the announcement is prefixed with "Local" or "Remote" so you can tell the two halves apart.</p>
+
+<p>For the local-then-remote and remote-then-local modes to work, the other machine also needs this add-on installed and running. If the other end does not respond within two seconds — for example because it has an older version of the add-on, or the network is being slow — your own machine's battery is announced anyway so you are never left without an answer.</p>
+
+<p>The chord NVDA uses for "report battery status" can be changed from NVDA's Input gestures dialog under System status. This add-on intercepts whatever chord is currently bound to it, not specifically NVDA+Shift+B, so customised hotkeys work the same way.</p>
 
 <h2>Security</h2>
 
